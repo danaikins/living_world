@@ -4,7 +4,7 @@ use bevy::window::PrimaryWindow; // Needed to get mouse coordinates
 // Constants
 const TILE_WIDTH: f32 = 64.0;
 const TILE_HEIGHT: f32 = 32.0;
-const MAP_SIZE: i32 = 10;
+const MAP_SIZE: i32 = 20;
 
 // --- COMPONENTS ---
 // This tags an entity as being a "Tile" at a specific grid location
@@ -94,6 +94,12 @@ struct ChartTextBabies;
 #[derive(Component)]
 struct ReproductionCooldown(Timer);
 
+#[derive(Component)]
+struct History {
+    last_x: i32,
+    last_y: i32,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -119,6 +125,7 @@ fn main() {
             update_chart_ui,
             creature_state_update,
             creature_eating,
+            predator_hunting_system,
             creature_reproduction
         ))
         .run();
@@ -161,12 +168,11 @@ fn setup(mut commands: Commands) {
 }
 
 fn spawn_map(mut commands: Commands) {
-    // Spawn Ground
+    // 1. Spawn Ground
     for x in -MAP_SIZE..MAP_SIZE {
         for y in -MAP_SIZE..MAP_SIZE {
             let screen_x = (x - y) as f32 * (TILE_WIDTH / 2.0);
             let screen_y = (x + y) as f32 * (TILE_HEIGHT / 2.0);
-
             commands.spawn((
                 Sprite::from_color(Color::srgb(0.3, 0.5, 0.3), Vec2::new(TILE_WIDTH - 2.0, TILE_HEIGHT - 2.0)),
                 Transform::from_xyz(screen_x, screen_y, 0.0),
@@ -175,10 +181,9 @@ fn spawn_map(mut commands: Commands) {
         }
     }
 
-    // Spawn 5 Creatures at random spots
-    // We give them a high Z (2.0) so they stand on top of the cursor (1.0) and ground (0.0)
-    // Spawn 5 Creatures
-    for i in 0..5 {
+    // 2. Spawn Sheep (White)
+    // Spawn Sheep
+    for i in 0..8 {
         commands.spawn((
             Sprite::from_color(Color::srgb(1.0, 1.0, 1.0), Vec2::new(20.0, 20.0)),
             Transform::from_xyz(0.0, 0.0, 2.0),
@@ -186,9 +191,27 @@ fn spawn_map(mut commands: Commands) {
             GridPosition { x: i, y: i },
             MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
             Hunger(0.0),
-            CreatureStats { sight_range: 5, species_id: 0 },
+            CreatureStats { sight_range: 8, species_id: 0 },
             CreatureBehavior { scared_of_water: true, altruistic: true },
-            Age { seconds_alive: 20.0, is_adult: true }, // Starts as adult (20s+ old)
+            Age { seconds_alive: 20.0, is_adult: true },
+            History { last_x: i, last_y: i }, // NEW
+        ));
+    }
+
+    // Spawn Wolves
+    let wolf_coords = vec![(-5, -5), (5, -5)];
+    for (wx, wy) in wolf_coords {
+        commands.spawn((
+            Sprite::from_color(Color::srgb(0.4, 0.2, 0.1), Vec2::new(22.0, 22.0)),
+            Transform::from_xyz(0.0, 0.0, 2.0),
+            Creature,
+            GridPosition { x: wx, y: wy },
+            MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
+            Hunger(0.0),
+            CreatureStats { sight_range: 10, species_id: 1 },
+            CreatureBehavior { scared_of_water: true, altruistic: false },
+            Age { seconds_alive: 20.0, is_adult: true },
+            History { last_x: wx, last_y: wy }, // NEW
         ));
     }
 }
@@ -264,56 +287,107 @@ fn cursor_system(
 
 fn move_creatures(
     time: Res<Time>,
-    // Update query to fetch the Cooldown optionally
-    mut q_creatures: Query<(&mut GridPosition, &mut MoveTimer, &CreatureBehavior, Option<&ReproductionCooldown>), (With<Creature>, Without<Dead>)>,
+    mut param_set: ParamSet<(
+        // P0: Snapshot Query
+        Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
+        // P1: Movement Query (Added History)
+        Query<(Entity, &mut GridPosition, &mut MoveTimer, &CreatureBehavior, &CreatureStats, Option<&ReproductionCooldown>, &mut History), (With<Creature>, Without<Dead>)>
+    )>,
     q_water: Query<&Tile, With<Water>>,
 ) {
-    for (mut pos, mut timer, behavior, cooldown) in q_creatures.iter_mut() {
-        // Base speed is 0.2. If recovering (cooldown exists), slow down to 0.4.
+    // 1. SNAPSHOT PASS
+    struct Snapshot { entity: Entity, x: i32, y: i32, species: u32 }
+    let mut targets: Vec<Snapshot> = Vec::new();
+    for (e, pos, stats) in param_set.p0().iter() {
+        targets.push(Snapshot { entity: e, x: pos.x, y: pos.y, species: stats.species_id });
+    }
+
+    // 2. MOVEMENT PASS
+    for (my_entity, mut my_pos, mut timer, behavior, my_stats, cooldown, mut history) in param_set.p1().iter_mut() {
+
         let target_duration = if cooldown.is_some() { 0.5 } else { 0.2 };
         timer.0.set_duration(std::time::Duration::from_secs_f32(target_duration));
-
         timer.0.tick(time.delta());
 
         if timer.0.is_finished() {
-            // Try up to 4 times to find a safe spot
-            for _ in 0..4 {
-                let dir = rand::random::<u32>() % 4;
-                let mut target_x = pos.x;
-                let mut target_y = pos.y;
+            // Save current position before moving
+            let current_x = my_pos.x;
+            let current_y = my_pos.y;
 
-                match dir {
-                    0 => target_y += 1,
-                    1 => target_y -= 1,
-                    2 => target_x -= 1,
-                    3 => target_x += 1,
-                    _ => {}
+            // Target Selection (Same as before)
+            let mut best_target_pos: Option<(i32, i32)> = None;
+            let mut min_dist = 9999;
+
+            for other in targets.iter() {
+                if my_entity == other.entity { continue; }
+                let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
+
+                if my_stats.species_id == 1 && other.species == 0 { // Wolf -> Sheep
+                    if dist < my_stats.sight_range && dist < min_dist {
+                        min_dist = dist;
+                        best_target_pos = Some((other.x, other.y));
+                    }
+                } else if my_stats.species_id == 0 && other.species == 1 { // Sheep -> Wolf
+                    if dist < my_stats.sight_range && dist < min_dist {
+                        min_dist = dist;
+                        best_target_pos = Some((other.x, other.y));
+                    }
+                }
+            }
+
+            // Move Evaluation
+            let moves = [(0,1), (0,-1), (-1,0), (1,0)];
+            let mut best_move = (0, 0);
+            let mut best_score = -9999;
+            let random_bias = rand::random::<i32>() % 5;
+
+            for (dx, dy) in moves {
+                let check_x = my_pos.x + dx;
+                let check_y = my_pos.y + dy;
+
+                let mut score = random_bias;
+
+                // Bounds Check
+                if check_x < -MAP_SIZE || check_x >= MAP_SIZE || check_y < -MAP_SIZE || check_y >= MAP_SIZE {
+                    score = -10000;
                 }
 
-                // Clamp to map bounds
-                target_x = target_x.clamp(-MAP_SIZE, MAP_SIZE - 1);
-                target_y = target_y.clamp(-MAP_SIZE, MAP_SIZE - 1);
-
-                // --- FEAR CHECKS ---
-                let mut is_safe = true;
-
-                // Check 1: Scared of Water?
+                // Water Check
                 if behavior.scared_of_water {
-                    for water_tile in q_water.iter() {
-                        if water_tile.x == target_x && water_tile.y == target_y {
-                            is_safe = false; // ABORT: It's water!
+                    for water in q_water.iter() {
+                        if water.x == check_x && water.y == check_y {
+                            score -= 1000;
                             break;
                         }
                     }
                 }
 
-                if is_safe {
-                    pos.x = target_x;
-                    pos.y = target_y;
-                    break; // We moved, stop checking directions
+                // --- NEW: HISTORY CHECK (Anti-Dance) ---
+                // If this move puts us back where we just were, penalize it heavily.
+                if check_x == history.last_x && check_y == history.last_y {
+                    score -= 50;
                 }
-                // If not safe, loop runs again and tries a different random direction
+
+                // Target Logic
+                if let Some((tx, ty)) = best_target_pos {
+                    let dist_after_move = (check_x - tx).abs() + (check_y - ty).abs();
+                    if my_stats.species_id == 1 { score -= dist_after_move * 10; }
+                    else { score += dist_after_move * 10; }
+                }
+
+                if score > best_score {
+                    best_score = score;
+                    best_move = (dx, dy);
+                }
             }
+
+            // Apply Move
+            my_pos.x += best_move.0;
+            my_pos.y += best_move.1;
+
+            // Update History
+            history.last_x = current_x;
+            history.last_y = current_y;
         }
     }
 }
@@ -410,25 +484,36 @@ fn plant_growth_system(
 fn creature_state_update(
     mut commands: Commands,
     time: Res<Time>,
-    mut q_creatures: Query<(Entity, &mut Hunger, &mut Sprite, &mut Age, Option<&mut ReproductionCooldown>), (With<Creature>, Without<Dead>)>,
+    // ADDED: CreatureStats to the query so we know which species it is
+    mut q_creatures: Query<(Entity, &mut Hunger, &mut Sprite, &mut Age, Option<&mut ReproductionCooldown>, &CreatureStats), (With<Creature>, Without<Dead>)>,
 ) {
     let dt = time.delta().as_secs_f32();
     let current_time = time.elapsed_secs();
 
-    for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt) in q_creatures.iter_mut() {
+    for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt, stats) in q_creatures.iter_mut() {
 
-        // 1. Growth
+        // 1. Growth & Size
         age.seconds_alive += dt;
         if !age.is_adult && age.seconds_alive > 20.0 {
             age.is_adult = true;
         }
 
-        let target_scale = if age.is_adult { 20.0 } else { 10.0 };
+        // Wolves are naturally larger (Adult 22 vs 20)
+        let base_size = if stats.species_id == 1 { 22.0 } else { 20.0 };
+        let baby_size = base_size / 2.0;
+
+        let target_scale = if age.is_adult { base_size } else { baby_size };
         sprite.custom_size = Some(Vec2::new(target_scale, target_scale));
 
         // 2. Hunger Burn
-        let burn_rate = if age.is_adult { 3.3 } else { 1.65 };
-        hunger.0 += burn_rate * dt;
+        // let burn_rate = if age.is_adult { 3.3 } else { 1.65 };
+        // hunger.0 += burn_rate * dt;
+        let base_burn = if age.is_adult { 3.3 } else { 1.65 };
+
+        // Wolves burn 33% faster
+        let final_burn = if stats.species_id == 1 { base_burn * 1.33 } else { base_burn };
+
+        hunger.0 += final_burn * dt;
 
         // 3. Cooldown Logic
         let mut on_cooldown = false;
@@ -443,16 +528,28 @@ fn creature_state_update(
 
         // 4. Visuals (Color)
         if on_cooldown {
-            // Purple pulse
+            // Pulse Purple/Pink
             let pulse = (current_time * 5.0).sin().abs();
             let r = 0.5 + (0.5 * pulse);
             let b = 1.0 - (0.5 * pulse);
             sprite.color = Color::srgb(r, 0.0, b);
         } else {
-            // Hunger status
-            if hunger.0 > 90.0 { sprite.color = Color::srgb(1.0, 0.0, 0.0); }
-            else if hunger.0 > 50.0 { sprite.color = Color::srgb(1.0, 1.0, 0.0); }
-            else { sprite.color = Color::srgb(1.0, 1.0, 1.0); }
+            // SPECIES COLOR LOGIC
+            if stats.species_id == 0 {
+                // SHEEP: White -> Yellow -> Red
+                if hunger.0 > 90.0 { sprite.color = Color::srgb(1.0, 0.0, 0.0); }
+                else if hunger.0 > 50.0 { sprite.color = Color::srgb(1.0, 1.0, 0.0); }
+                else { sprite.color = Color::srgb(1.0, 1.0, 1.0); }
+            } else {
+                // WOLF: Brown -> Orange -> Red
+                if hunger.0 > 90.0 {
+                    sprite.color = Color::srgb(1.0, 0.0, 0.0); // Critical Red
+                } else if hunger.0 > 50.0 {
+                    sprite.color = Color::srgb(0.8, 0.4, 0.0); // Hungry Orange
+                } else {
+                    sprite.color = Color::srgb(0.4, 0.2, 0.1); // Happy Brown
+                }
+            }
         }
 
         // 5. Starvation
@@ -472,6 +569,8 @@ fn creature_eating(
 ) {
     for (plant_entity, plant_pos) in q_plants.iter() {
         for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior) in q_creatures.iter_mut() {
+            if my_stats.species_id == 1 { continue; }
+
             if my_pos.x == plant_pos.x && my_pos.y == plant_pos.y {
 
                 // Full Check
@@ -516,26 +615,19 @@ fn creature_reproduction(
     mut commands: Commands,
     q_creatures: Query<(Entity, &GridPosition, &Age, &CreatureStats, &CreatureBehavior, Option<&ReproductionCooldown>), (With<Creature>, Without<Dead>)>,
 ) {
-    // Check every pair (A, B)
     for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a),
     (entity_b, pos_b, age_b, stats_b, _, cooldown_b)] in q_creatures.iter_combinations()
     {
-        // 1. Basic Requirements Check
-        if !age_a.is_adult || !age_b.is_adult { continue; } // Must be adults
-        if cooldown_a.is_some() || cooldown_b.is_some() { continue; } // No cooldowns
-        if stats_a.species_id != stats_b.species_id { continue; } // Same species
+        if !age_a.is_adult || !age_b.is_adult { continue; }
+        if cooldown_a.is_some() || cooldown_b.is_some() { continue; }
+        if stats_a.species_id != stats_b.species_id { continue; }
 
-        // 2. Distance Check (Touching)
         let dist = (pos_a.x - pos_b.x).abs() + (pos_a.y - pos_b.y).abs();
         if dist > 1 { continue; }
 
-        // 3. Chance to Reproduce (10% per frame if conditions met)
-        // Lowered chance because iter_combinations checks very often
         if rand::random::<f32>() < 0.10 {
-
-            // SPAWN BABY
             let baby_x = pos_a.x;
-            let baby_y = pos_a.y; // Spawn at parent A's location
+            let baby_y = pos_a.y;
 
             let screen_x = (baby_x - baby_y) as f32 * (TILE_WIDTH / 2.0);
             let screen_y = (baby_x + baby_y) as f32 * (TILE_HEIGHT / 2.0);
@@ -547,12 +639,13 @@ fn creature_reproduction(
                 GridPosition { x: baby_x, y: baby_y },
                 MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
                 Hunger(0.0),
+                // Correctly passing ONE set of stats
                 CreatureStats { sight_range: stats_a.sight_range, species_id: stats_a.species_id },
                 CreatureBehavior { scared_of_water: behavior_a.scared_of_water, altruistic: behavior_a.altruistic },
                 Age { seconds_alive: 0.0, is_adult: false },
+                History { last_x: baby_x, last_y: baby_y }, // Only once
             ));
 
-            // APPLY COOLDOWNS
             commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
             commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
 
@@ -740,5 +833,54 @@ fn update_chart_ui(
     // 5. Babies
     for mut text in text_params.p4().iter_mut() {
         **text = format!(" Babies: {}", babies);
+    }
+}
+
+fn predator_hunting_system(
+    mut commands: Commands,
+    mut q_wolves: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats), (With<Creature>, Without<Dead>)>,
+    q_sheep: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
+) {
+    for (_wolf_entity, wolf_pos, mut wolf_hunger, wolf_stats) in q_wolves.iter_mut() {
+        if wolf_stats.species_id != 1 { continue; }
+
+        for (sheep_entity, sheep_pos, sheep_stats) in q_sheep.iter() {
+            if sheep_stats.species_id != 0 { continue; }
+
+            if wolf_pos.x == sheep_pos.x && wolf_pos.y == sheep_pos.y {
+                // Eat
+                wolf_hunger.0 = 0.0;
+                commands.entity(sheep_entity).insert(Dead);
+
+                // Blood FX
+                let screen_x = (wolf_pos.x - wolf_pos.y) as f32 * (TILE_WIDTH / 2.0);
+                let screen_y = (wolf_pos.x + wolf_pos.y) as f32 * (TILE_HEIGHT / 2.0);
+                commands.spawn((
+                    Sprite::from_color(Color::srgb(0.8, 0.0, 0.0), Vec2::new(10.0, 40.0)),
+                    Transform::from_xyz(screen_x, screen_y, 0.1).with_rotation(Quat::from_rotation_z(0.785)),
+                    ExhaustedSoil(Timer::from_seconds(30.0, TimerMode::Once)),
+                    GridPosition { x: wolf_pos.x, y: wolf_pos.y },
+                ));
+
+                println!("Wolf ate a Sheep!");
+
+                // Reproduction (Brown Baby)
+                if rand::random::<f32>() < 0.15 {
+                    commands.spawn((
+                        Sprite::from_color(Color::srgb(0.4, 0.2, 0.1), Vec2::new(15.0, 15.0)),
+                        Transform::from_xyz(screen_x, screen_y, 2.0),
+                        Creature,
+                        GridPosition { x: wolf_pos.x, y: wolf_pos.y },
+                        MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
+                        Hunger(0.0),
+                        CreatureStats { sight_range: 10, species_id: 1 },
+                        CreatureBehavior { scared_of_water: true, altruistic: false },
+                        Age { seconds_alive: 0.0, is_adult: false },
+                    ));
+                    println!("Wolf born!");
+                }
+                break;
+            }
+        }
     }
 }
