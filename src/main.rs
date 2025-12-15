@@ -128,6 +128,9 @@ struct SpeciesStatsSheepText;
 #[derive(Component)]
 struct SpeciesStatsWolfText;
 
+#[derive(Component)]
+struct BerryStun(Timer); // short immobile state after eating berries
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -385,6 +388,7 @@ fn cursor_system(
 }
 
 fn move_creatures(
+    mut commands: Commands,
     time: Res<Time>,
     mut param_set: ParamSet<(
         Query<(Entity, &GridPosition, &CreatureStats, &Age), (With<Creature>, Without<Dead>)>,
@@ -398,6 +402,7 @@ fn move_creatures(
             &mut History,
             Option<&Digesting>,
             Option<&Overfed>,
+            Option<&mut BerryStun>,
             &Hunger,
             &Age
         ), (With<Creature>, Without<Dead>)>,
@@ -441,11 +446,25 @@ fn move_creatures(
         mut history,
         digesting,
         overfed,
+        berry_stun,
         my_hunger,
         my_age,
     ) in param_set.p1().iter_mut()
     {
-        // Timer logic unchanged...
+        // --- BERRY STUN LOGIC ---
+        if let Some(mut stun) = berry_stun {
+            stun.0.tick(time.delta());
+
+            if !stun.0.is_finished() {
+                // Immobilized for berry digestion
+                continue;
+            } else {
+                // Stun over
+                commands.entity(my_entity).remove::<BerryStun>();
+            }
+        }
+
+        // Timer logic
         let base_duration = 0.2;
         let mut target_duration = if cooldown.is_some() { 0.5 } else { base_duration };
         if overfed.is_some() {
@@ -874,6 +893,14 @@ fn creature_eating(
                 my_hunger.0 = 0.0;
                 commands.entity(plant_entity).insert(Dead);
 
+                // If wolf: apply 2-tick berry stun
+                if my_stats.species_id == 1 {
+                    // 2 ticks = 2 * base MoveTimer duration (0.2s each)
+                    commands.entity(my_entity).insert(BerryStun(
+                        Timer::from_seconds(0.4, TimerMode::Once),
+                    ));
+                }
+
                 // Spawn Exhausted Soil (existing)
                 let screen_x = (my_pos.x - my_pos.y) as f32 * (TILE_WIDTH / 2.0);
                 let screen_y = (my_pos.x + my_pos.y) as f32 * (TILE_HEIGHT / 2.0);
@@ -950,8 +977,18 @@ fn creature_reproduction(
                 History { last_x: baby_x, last_y: baby_y },
             ));
 
-            commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
-            commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
+            let cooldown_seconds = if species_id == 0 {
+                20.0 // Sheep reproduce faster
+            } else {
+                40.0 // Wolves reproduce slower
+            };
+
+            commands.entity(entity_a).insert(ReproductionCooldown(
+                Timer::from_seconds(cooldown_seconds, TimerMode::Once),
+            ));
+            commands.entity(entity_b).insert(ReproductionCooldown(
+                Timer::from_seconds(cooldown_seconds, TimerMode::Once),
+            ));
 
             if species_id == 0 {
                 println!("A new sheep is born!");
