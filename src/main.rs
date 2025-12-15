@@ -294,9 +294,7 @@ fn cursor_system(
 fn move_creatures(
     time: Res<Time>,
     mut param_set: ParamSet<(
-        // P0: Snapshot Query
         Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
-        // P1: Movement Query (Added History)
         Query<(
             Entity,
             &mut GridPosition,
@@ -304,21 +302,48 @@ fn move_creatures(
             &CreatureBehavior,
             &CreatureStats,
             Option<&ReproductionCooldown>,
+            &mut History,
             Option<&Digesting>,
             Option<&Overfed>,
-            &mut History
-        ), (With<Creature>, Without<Dead>)>
+            &Hunger,
+            &Age
+        ), (With<Creature>, Without<Dead>)>,
+        Query<&GridPosition, With<Plant>>,
+        Query<&GridPosition, With<Water>>,
     )>,
-    q_water: Query<&Tile, With<Water>>,
 ) {
-    // 1. SNAPSHOT PASS
-    struct Snapshot { entity: Entity, x: i32, y: i32, species: u32 }
-    let mut targets: Vec<Snapshot> = Vec::new();
-    for (e, pos, stats) in param_set.p0().iter() {
-        targets.push(Snapshot { entity: e, x: pos.x, y: pos.y, species: stats.species_id });
+    // 1. Creature snapshot
+    struct CreatureSnapshot {
+        entity: Entity,
+        x: i32,
+        y: i32,
+        species: u32,
     }
+    let creature_targets: Vec<CreatureSnapshot> = param_set
+        .p0()
+        .iter()
+        .map(|(e, pos, stats)| CreatureSnapshot {
+            entity: e,
+            x: pos.x,
+            y: pos.y,
+            species: stats.species_id,
+        })
+        .collect();
 
-    // 2. MOVEMENT PASS
+    // 2. Plant and water snapshots (done here while no mutable borrow active)
+    let plant_positions: Vec<(i32, i32)> = param_set
+        .p2()
+        .iter()
+        .map(|pos| (pos.x, pos.y))
+        .collect();
+
+    let water_tiles: Vec<(i32, i32)> = param_set
+        .p3()
+        .iter()
+        .map(|pos| (pos.x, pos.y))
+        .collect();
+
+    // 3. Now mutate creatures — safe because p0, p2, p3 are no longer borrowed
     for (
         my_entity,
         mut my_pos,
@@ -326,126 +351,135 @@ fn move_creatures(
         behavior,
         my_stats,
         cooldown,
+        mut history,
         digesting,
         overfed,
-        mut history
-    ) in param_set.p1().iter_mut()  {
-
-        let target_duration = if cooldown.is_some() { 0.5 } else { 0.2 };
+        my_hunger,
+        age,
+    ) in param_set.p1().iter_mut()
+    {
+        // Timer logic
+        let base_duration = 0.2;
+        let mut target_duration = if cooldown.is_some() { 0.5 } else { base_duration };
+        if overfed.is_some() {
+            target_duration = base_duration * 6.6;
+        }
         timer.0.set_duration(std::time::Duration::from_secs_f32(target_duration));
         timer.0.tick(time.delta());
 
-        if digesting.is_some() {
-            // STOP MOVING completely
+        if digesting.is_some() || !timer.0.is_finished() {
             continue;
         }
 
-        let base_duration = 0.2;
-        let mut target_duration = if cooldown.is_some() { 0.5 } else { base_duration };
+        let old_x = my_pos.x;
+        let old_y = my_pos.y;
 
-        if overfed.is_some() {
-            // 15% speed = Time takes 100/15 ~= 6.6x longer
-            target_duration = base_duration * 6.6;
-        }
+        // === TARGET SELECTION ===
+        let mut target_pos: Option<(i32, i32)> = None;
+        let mut target_type = 0; // 1=food, 2=mate, 3=prey, 4=predator
 
-        timer.0.set_duration(std::time::Duration::from_secs_f32(target_duration));
-        timer.0.tick(time.delta());
+        let is_sheep = my_stats.species_id == 0;
+        let hunger_level = my_hunger.0;
+        let is_full = hunger_level <= 10.0;
+        let can_breed = age.is_adult && cooldown.is_none() && digesting.is_none() && overfed.is_none();
 
-        if timer.0.is_finished() {
-            // Save current position before moving
-            let current_x = my_pos.x;
-            let current_y = my_pos.y;
-
-            // Target Selection (Same as before)
-            let mut best_target_pos: Option<(i32, i32)> = None;
-            let mut min_dist = 9999;
-
-            for other in targets.iter() {
-                if my_entity == other.entity { continue; }
-                let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
-
-                if my_stats.species_id == 1 && other.species == 0 { // Wolf -> Sheep
-                    if dist < my_stats.sight_range && dist < min_dist {
-                        min_dist = dist;
-                        best_target_pos = Some((other.x, other.y));
-                    }
-                } else if my_stats.species_id == 0 && other.species == 1 { // Sheep -> Wolf
-                    if dist < my_stats.sight_range && dist < min_dist {
-                        min_dist = dist;
-                        best_target_pos = Some((other.x, other.y));
+        if is_sheep {
+            // Seek mate if full and ready
+            if is_full && can_breed {
+                let mut best_dist = 9999;
+                for other in &creature_targets {
+                    if my_entity == other.entity || other.species != 0 { continue; }
+                    let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
+                    if dist > 1 && dist < my_stats.sight_range && dist < best_dist {
+                        best_dist = dist;
+                        target_pos = Some((other.x, other.y));
+                        target_type = 2;
                     }
                 }
             }
 
-            // Move Evaluation
-            let moves = [(0,1), (0,-1), (-1,0), (1,0)];
-            let mut best_move = (0, 0);
-            let mut best_score = -9999;
-
-            // Determine if we're actively pursuing/fleeing
-            let has_target = best_target_pos.is_some();
-
-            for (dx, dy) in moves {
-                let check_x = my_pos.x + dx;
-                let check_y = my_pos.y + dy;
-
-                // Start with random bias (stronger when not pursuing)
-                let random_component = if has_target {
-                    rand::random::<i32>() % 3  // Small randomness when focused
-                } else {
-                    rand::random::<i32>() % 20  // Much larger randomness when wandering
-                };
-                let mut score = random_component;
-
-                // Bounds Check
-                if check_x < -MAP_SIZE || check_x >= MAP_SIZE || check_y < -MAP_SIZE || check_y >= MAP_SIZE {
-                    score = -10000;
-                }
-
-                // Water Check
-                if behavior.scared_of_water {
-                    for water in q_water.iter() {
-                        if water.x == check_x && water.y == check_y {
-                            score -= 1000;
-                            break;
-                        }
+            // Seek food if hungry
+            if target_pos.is_none() && hunger_level > 30.0 {
+                let mut best_dist = 9999;
+                for &(px, py) in &plant_positions {
+                    let dist = (my_pos.x - px).abs() + (my_pos.y - py).abs();
+                    if dist > 0 && dist < my_stats.sight_range && dist < best_dist {
+                        best_dist = dist;
+                        target_pos = Some((px, py));
+                        target_type = 1;
                     }
                 }
+            }
+        }
 
-                // History Check (Anti-Dance)
-                // Only apply strong penalty if we have valid moves or a target
-                if check_x == history.last_x && check_y == history.last_y {
-                    if has_target {
-                        score -= 100;  // Strongly avoid when chasing/fleeing
-                    } else {
-                        score -= 30;   // Moderate penalty when wandering
-                    }
+        // Predator/prey override
+        let mut threat_dist = 9999;
+        for other in &creature_targets {
+            if my_entity == other.entity { continue; }
+            let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
+            if dist >= my_stats.sight_range { continue; }
+
+            if my_stats.species_id == 1 && other.species == 0 {
+                if dist < threat_dist {
+                    threat_dist = dist;
+                    target_pos = Some((other.x, other.y));
+                    target_type = 3;
                 }
-
-                // Target Logic (Only applies when we have a target)
-                if let Some((tx, ty)) = best_target_pos {
-                    let dist_after_move = (check_x - tx).abs() + (check_y - ty).abs();
-                    if my_stats.species_id == 1 {
-                        score -= dist_after_move * 15;  // Wolves chase aggressively
-                    } else {
-                        score += dist_after_move * 15;  // Sheep flee urgently
-                    }
+            } else if my_stats.species_id == 0 && other.species == 1 {
+                if dist < threat_dist {
+                    threat_dist = dist;
+                    target_pos = Some((other.x, other.y));
+                    target_type = 4;
                 }
+            }
+        }
 
-                if score > best_score {
-                    best_score = score;
-                    best_move = (dx, dy);
+        // === MOVE EVALUATION ===
+        let moves = [(0,1), (0,-1), (-1,0), (1,0)];
+        let mut best_move = (0, 0);
+        let mut best_score = -9999_i32;
+
+        for (dx, dy) in moves {
+            let nx = my_pos.x + dx;
+            let ny = my_pos.y + dy;
+
+            if nx < -MAP_SIZE || nx >= MAP_SIZE || ny < -MAP_SIZE || ny >= MAP_SIZE {
+                continue;
+            }
+
+            let mut score = rand::random::<i32>() % 20;
+
+            if behavior.scared_of_water && water_tiles.contains(&(nx, ny)) {
+                score -= 1000;
+            }
+
+            if nx == history.last_x && ny == history.last_y {
+                score -= 30;
+            }
+
+            if let Some((tx, ty)) = target_pos {
+                let dist_now = (my_pos.x - tx).abs() + (my_pos.y - ty).abs();
+                let dist_after = (nx - tx).abs() + (ny - ty).abs();
+                let delta = dist_after - dist_now;
+
+                match target_type {
+                    1 | 2 | 3 => score -= delta * 20,
+                    4 => score += delta * 20,
+                    _ => {}
                 }
             }
 
-            // Apply Move
-            my_pos.x += best_move.0;
-            my_pos.y += best_move.1;
-
-            // Update History
-            history.last_x = current_x;
-            history.last_y = current_y;
+            if score > best_score {
+                best_score = score;
+                best_move = (dx, dy);
+            }
         }
+
+        my_pos.x += best_move.0;
+        my_pos.y += best_move.1;
+
+        history.last_x = old_x;
+        history.last_y = old_y;
     }
 }
 
