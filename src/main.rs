@@ -325,6 +325,16 @@ struct TextBoxFocus {
     buffer: String,
 }
 
+
+
+#[derive(Component)]
+struct WorldShadow {
+    phase: f32,
+    drift_a: f32,
+    drift_b: f32,
+    base_y: f32,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -363,6 +373,9 @@ fn main() {
             debug_slider_system,
             debug_textbox_system,
         ))
+
+        .add_systems(Startup, spawn_world_shadow)
+        .add_systems(Update, animate_world_shadow)
         .run();
 }
 
@@ -375,7 +388,7 @@ fn setup(mut commands: Commands) {
     //commands.insert_resource(PopulationStats::default());
 
     // 2. Spawn Camera
-    let mut camera_transform = Transform::from_xyz(0.0, 0.0, 1000.0);
+    let mut camera_transform = Transform::from_xyz(0.0, 0.0, 800.0);
     camera_transform.scale = Vec3::new(1.5, 1.5, 1.0);
     commands.spawn((Camera2d, camera_transform));
 
@@ -525,6 +538,62 @@ fn spawn_map(
         ));
     }
 }
+
+fn spawn_world_shadow(mut commands: Commands, cfg: Res<SimulationConfig>) {
+    let map = cfg.map_size as f32;
+    let half_w = cfg.tile_w * map;
+    let half_h = cfg.tile_h * map;
+
+    // True diamond bounds of the tile carpet
+    let diamond_width  = half_w * 2.0;
+    let diamond_height = half_h * 2.0;
+
+    // Shadow slightly larger than the platform
+    let scale = 1.5;
+    let w = diamond_width * scale;
+    let h = diamond_height * scale;
+
+    // Push down so it peeks out under the platform
+    let base_y = -half_h * 0.9;
+    let base_z = -0.01;
+
+    commands.spawn((
+        Sprite::from_color(Color::srgba(0.05, 0.05, 0.08, 0.45), Vec2::new(w, h)),
+        Transform::from_xyz(0.0, base_y, base_z)
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_4)), // 45° for diamond
+        WorldShadow {
+            phase: rand::random::<f32>() * std::f32::consts::TAU,
+            drift_a: 0.06 + rand::random::<f32>() * 0.03,
+            drift_b: 0.03 + rand::random::<f32>() * 0.02,
+            base_y,
+        },
+    ));
+}
+
+fn animate_world_shadow(time: Res<Time>, mut q: Query<(&mut Transform, &mut Sprite, &mut WorldShadow)>) {
+    for (mut tr, mut spr, mut sh) in q.iter_mut() {
+        let dt = time.delta().as_secs_f32();
+        sh.phase += dt;
+
+        // Slow deliberate "hover" motion (not jittery)
+        let y_float = (sh.phase * sh.drift_a).sin() * 18.0 + (sh.phase * sh.drift_b).sin() * 10.0;
+        tr.translation.y = sh.base_y + y_float;
+
+        // Keep it hovering around its original offset by nudging relative to current baseline
+        // (Better: store base_y if you want; this works fine visually.)
+        tr.translation.y += y_float * dt;
+
+        // Color pulse: black <-> deep blue, with red hints
+        let pulse = (time.elapsed_secs() * 0.35).sin() * 0.5 + 0.5;
+        let a = 0.25 + pulse * 0.20; // lower max alpha
+        let r = 0.02 + pulse * 0.12;
+        let g = 0.01 + pulse * 0.03;
+        let b = 0.06 + pulse * 0.28;
+
+        spr.color = Color::srgba(r, g, b, a);
+    }
+}
+
 
 // --- LOGIC SYSTEMS ---
 
