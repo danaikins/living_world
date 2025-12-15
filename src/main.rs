@@ -4,6 +4,9 @@ use bevy::ui::ComputedNode;
 use bevy::input::keyboard::{KeyboardInput, Key};
 use bevy::ecs::prelude::ChildSpawnerCommands;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Constants
 const TILE_WIDTH: f32 = 64.0;
@@ -146,6 +149,60 @@ impl SimulationConfig {
     }
     fn s_mut(&mut self, id: u32) -> &mut SpeciesConfig {
         self.species.get_mut(&id).expect("Missing SpeciesConfig")
+    }
+}
+
+// --- GENETICS COMPONENTS ---
+
+#[derive(Component, Clone, Copy, Debug)]
+struct Dna {
+    move_speed_seconds: f32, // Lower is faster
+    metabolism_rate: f32,    // Hunger per second (Lower is better)
+    sight_range: i32,        // Higher is better
+    size_multiplier: f32,    // Cosmetic + maybe dominance?
+}
+
+#[derive(Component)]
+struct Generation(u32);
+
+#[derive(Component)]
+struct CreatureName(String);
+
+// --- LOGGING RESOURCE ---
+#[derive(Resource)]
+struct SimulationLogger {
+    file: Option<File>,
+}
+
+impl Default for SimulationLogger {
+    fn default() -> Self {
+        // Create a unique filename based on time
+        let start = SystemTime::now();
+        let timestamp = start.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let filename = format!("sim_log_{}.csv", timestamp);
+
+        let mut file = File::create(&filename).ok();
+
+        // Write CSV Header
+        if let Some(ref mut f) = file {
+            writeln!(f, "Event,Time,Species,Name,Gen,Speed,Metabolism,Sight").ok();
+        }
+
+        Self { file }
+    }
+}
+
+impl SimulationLogger {
+    // Renamed 'gen' -> 'generation'
+    fn log(&mut self, event_type: &str, time: f32, species: &str, name: &str, generation: u32, dna: &Dna) {
+        if let Some(ref mut f) = self.file {
+            writeln!(
+                f,
+                "{},{:.2},{},{},{},{:.3},{:.3},{}",
+                event_type, time, species, name, generation,
+                dna.move_speed_seconds, dna.metabolism_rate, dna.sight_range
+            ).ok();
+        }
     }
 }
 
@@ -341,6 +398,7 @@ fn main() {
             }),
             ..default()
         }))
+        .insert_resource(SimulationLogger::default())
         .insert_resource(SimulationConfig::default())
         .insert_resource(PopulationStats::default())
         .insert_resource(GameStats { days: 0.0 })
@@ -470,6 +528,7 @@ fn spawn_map(
     mut commands: Commands,
     mut pop: ResMut<PopulationStats>,
     cfg: Res<SimulationConfig>,
+    mut logger: ResMut<SimulationLogger>,
 ) {
     let map_size = cfg.map_size;
     let tile_w = cfg.tile_w;
@@ -495,42 +554,68 @@ fn spawn_map(
         entry.born += 1;
         entry.total_ever += 1;
 
+        // Base Genetics for Sheep Gen 0
+        let dna = Dna {
+            move_speed_seconds: cfg.base_move_seconds,
+            metabolism_rate: cfg.sheep_hunger_burn_baby, // Start with baby burn
+            sight_range: sheep_cfg.sight_range,
+            size_multiplier: 1.0,
+        };
+        let name = generate_name();
+
+        logger.log("Spawn", 0.0, "Sheep", &name, 0, &dna);
+
         commands.spawn((
             Sprite::from_color(Color::srgb(1.0, 1.0, 1.0), Vec2::new(20.0, 20.0)),
             Transform::from_xyz(0.0, 0.0, 2.0),
             Creature,
             GridPosition { x: i, y: i },
-            MoveTimer(Timer::from_seconds(cfg.base_move_seconds, TimerMode::Repeating)),
+            MoveTimer(Timer::from_seconds(dna.move_speed_seconds, TimerMode::Repeating)), // Use DNA
             Hunger(0.0),
-            CreatureStats { sight_range: sheep_cfg.sight_range, species_id: 0 },
+            CreatureStats { sight_range: dna.sight_range, species_id: 0 }, // Use DNA
             CreatureBehavior { scared_of_water: true, altruistic: true },
             Age { seconds_alive: 0.0, is_adult: false },
             History { last_x: i, last_y: i },
+            dna,               // <--- Add DNA
+            Generation(0),     // <--- Add Gen
+            CreatureName(name),// <--- Add Name
         ));
     }
 
-    // Starting wolves (born + total_ever; start as babies)
-    // Spread 4 wolves in a simple pattern
+    // --- UPDATED WOLF SPAWNING ---
     let wolf_cfg = cfg.s(1);
-    let wolf_coords = vec![(-6, -6), (-4, -6), (4, -6), (6, -6)];
+    let wolf_coords = vec![(-6, -6), (-4, -6), (4, -6), (6, -6), (0, -8), (0, -4)]; // Added spots for 6 wolves
     for idx in 0..(wolf_cfg.starting_count.min(wolf_coords.len() as u32) as usize) {
         let (wx, wy) = wolf_coords[idx];
-
         let entry = pop.species.entry(1).or_default();
         entry.born += 1;
         entry.total_ever += 1;
+
+        // Base Genetics for Wolves Gen 0
+        let dna = Dna {
+            move_speed_seconds: cfg.base_move_seconds, // Config base
+            metabolism_rate: cfg.wolf_hunger_burn_baby,
+            sight_range: wolf_cfg.sight_range,
+            size_multiplier: 1.1, // Wolves slightly bigger
+        };
+        let name = generate_name();
+
+        logger.log("Spawn", 0.0, "Wolf", &name, 0, &dna);
 
         commands.spawn((
             Sprite::from_color(Color::srgb(0.4, 0.2, 0.1), Vec2::new(22.0, 22.0)),
             Transform::from_xyz(0.0, 0.0, 2.0),
             Creature,
             GridPosition { x: wx, y: wy },
-            MoveTimer(Timer::from_seconds(cfg.base_move_seconds, TimerMode::Repeating)),
+            MoveTimer(Timer::from_seconds(dna.move_speed_seconds, TimerMode::Repeating)),
             Hunger(0.0),
-            CreatureStats { sight_range: wolf_cfg.sight_range, species_id: 1 },
+            CreatureStats { sight_range: dna.sight_range, species_id: 1 },
             CreatureBehavior { scared_of_water: true, altruistic: false },
             Age { seconds_alive: 0.0, is_adult: false },
             History { last_x: wx, last_y: wy },
+            dna,
+            Generation(0),
+            CreatureName(name),
         ));
     }
 }
@@ -683,6 +768,7 @@ fn move_creatures(
             Option<&mut BerryStun>,
             &Hunger,
             &Age,
+            &Dna,
         ), (With<Creature>, Without<Dead>)>,
         Query<&GridPosition, With<Plant>>,
         Query<&Tile, With<Water>>,
@@ -727,6 +813,7 @@ fn move_creatures(
         berry_stun,
         my_hunger,
         my_age,
+        dna,
     ) in param_set.p1().iter_mut()
     {
         // --- BERRY STUN ---
@@ -742,12 +829,12 @@ fn move_creatures(
             continue;
         }
 
-        let mut move_seconds = cfg.base_move_seconds;
+        let mut move_seconds = dna.move_speed_seconds;
         if cooldown.is_some() {
-            move_seconds = cfg.reproduction_move_seconds;
+            move_seconds = dna.move_speed_seconds * (cfg.reproduction_move_seconds / cfg.base_move_seconds);
         }
         if overfed.is_some() {
-            move_seconds = cfg.base_move_seconds * cfg.overfed_move_multiplier;
+            move_seconds = dna.move_speed_seconds * cfg.overfed_move_multiplier;
         }
 
         timer.0.set_duration(std::time::Duration::from_secs_f32(move_seconds));
@@ -1028,6 +1115,8 @@ fn creature_state_update(
     mut commands: Commands,
     time: Res<Time>,
     cfg: Res<SimulationConfig>,
+    game_stats: Res<GameStats>,
+    mut logger: ResMut<SimulationLogger>,
     mut q_creatures: Query<(
         Entity,
         &mut Hunger,
@@ -1036,13 +1125,16 @@ fn creature_state_update(
         Option<&mut ReproductionCooldown>,
         &CreatureStats,
         Option<&Digesting>,
-        Option<&mut Overfed>
+        Option<&mut Overfed>,
+        &Dna,
+        &Generation,
+        &CreatureName
     ), (With<Creature>, Without<Dead>)>,
 ) {
     let dt = time.delta().as_secs_f32();
     let current_time = time.elapsed_secs();
 
-    for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt, stats, digesting, mut overfed_opt) in q_creatures.iter_mut() {
+    for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt, stats, digesting, mut overfed_opt, dna, generation_comp, name) in q_creatures.iter_mut() {
 
         // 1. Growth & Size
         age.seconds_alive += dt;
@@ -1052,18 +1144,17 @@ fn creature_state_update(
         }
 
         let base_size = if stats.species_id == 1 { 22.0 } else { 20.0 };
-        let target_scale = if age.is_adult { base_size } else { base_size / 2.0 };
+        // Apply DNA Size Multiplier
+        let my_size = base_size * dna.size_multiplier;
+
+        let target_scale = if age.is_adult { my_size } else { my_size / 2.0 };
         sprite.custom_size = Some(Vec2::new(target_scale, target_scale));
 
-        // Burn per species + age
-        let burn = match (stats.species_id, age.is_adult) {
-            (0, true) => cfg.sheep_hunger_burn_adult,
-            (0, false) => cfg.sheep_hunger_burn_baby,
-            (1, true) => cfg.wolf_hunger_burn_adult,
-            (1, false) => cfg.wolf_hunger_burn_baby,
-            _ => 3.0,
-        };
-        hunger.0 += burn * dt;
+        // 2. Hunger (METABOLISM GENE)
+        // We use dna.metabolism_rate.
+        // Babies burn 50% of their adult genetic rate.
+        let burn_mult = if age.is_adult { 1.0 } else { 0.5 };
+        hunger.0 += dna.metabolism_rate * burn_mult * dt;
 
         // 2. DIGESTION & VISUALS LOGIC
         if digesting.is_some() {
@@ -1129,11 +1220,12 @@ fn creature_state_update(
         if hunger.0 >= 100.0 {
             commands.entity(entity).insert(Dead);
 
-            if stats.species_id == 0 {
-                println!("A sheep has starved to death!");
-            } else {
-                println!("A wolf has starved to death!");
-            }
+            let s_name = if stats.species_id == 0 { "Sheep" } else { "Wolf" };
+
+            // Use 'generation_comp.0' instead of 'gen.0'
+            println!("{} ({}) died of starvation (Gen {}).", name.0, s_name, generation_comp.0);
+
+            logger.log("Starved", game_stats.days, s_name, &name.0, generation_comp.0, dna);
         }
     }
 }
@@ -1237,51 +1329,60 @@ fn creature_reproduction(
     mut commands: Commands,
     cfg: Res<SimulationConfig>,
     mut pop: ResMut<PopulationStats>,
-    // UPDATE: Removed Option<&Digesting> and Option<&Overfed> from the query.
-    // We no longer check these, so we don't need to fetch them.
-    // BerryStun was never in the query, so it is also allowed by default.
+    game_stats: Res<GameStats>,
+    mut logger: ResMut<SimulationLogger>,
+    // Fetch Dna, Generation, Name
     q_creatures: Query<(
         Entity,
         &GridPosition,
         &Age,
         &CreatureStats,
         &CreatureBehavior,
-        Option<&ReproductionCooldown>
+        Option<&ReproductionCooldown>,
+        &Dna,            // <---
+        &Generation,     // <---
+        &CreatureName    // <---
     ), (With<Creature>, Without<Dead>)>,
 ) {
-    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a),
-    (entity_b, pos_b, age_b, stats_b, _,          cooldown_b)] in q_creatures.iter_combinations()
+    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, dna_a, gen_a, name_a),
+    (entity_b, pos_b, age_b, stats_b, _,          cooldown_b, dna_b, gen_b, name_b)] in q_creatures.iter_combinations()
     {
-        // 1. Both must be adults
         if !age_a.is_adult || !age_b.is_adult { continue; }
-
-        // 2. Neither can be on reproduction cooldown
         if cooldown_a.is_some() || cooldown_b.is_some() { continue; }
-
-        // REMOVED: The checks for Digesting and Overfed.
-        // Now, even if a wolf is digesting a sheep or stunned by berries,
-        // they can still reproduce if a partner is adjacent.
-
-        // 3. Must be same species
         if stats_a.species_id != stats_b.species_id { continue; }
 
-        // 4. Must be adjacent (Distance <= 1)
         let dist = (pos_a.x - pos_b.x).abs() + (pos_a.y - pos_b.y).abs();
         if dist > 1 { continue; }
 
         let sid = stats_a.species_id;
         let sc = cfg.s(sid);
 
+        // Mix Genes!
         if rand::random::<f32>() < sc.reproduction_chance {
-            // Update stats
             let entry = pop.species.entry(sid).or_default();
             entry.born += 1;
             entry.total_ever += 1;
 
-            // Spawn baby
+            // 1. Create Baby DNA
+            let baby_dna = mutate_dna(dna_a, dna_b);
+
+            // 2. Increment Generation
+            let baby_gen = Generation(gen_a.0.max(gen_b.0) + 1);
+
+            // 3. New Name
+            let baby_name = generate_name();
+
+            // Log it
+            let s_name = if sid == 0 { "Sheep" } else { "Wolf" };
+            println!("{} + {} = {} (Gen {})", name_a.0, name_b.0, baby_name, baby_gen.0);
+            println!(" -> Spd: {:.2}, Meta: {:.2}, Sight: {}",
+                     baby_dna.move_speed_seconds, baby_dna.metabolism_rate, baby_dna.sight_range);
+
+            logger.log("Born", game_stats.days, s_name, &baby_name, baby_gen.0, &baby_dna);
+
+            // Spawn
             let baby_x = pos_a.x;
             let baby_y = pos_a.y;
-
             let tile_w = cfg.tile_w;
             let tile_h = cfg.tile_h;
             let screen_x = (baby_x - baby_y) as f32 * (tile_w / 2.0);
@@ -1292,15 +1393,19 @@ fn creature_reproduction(
                 Transform::from_xyz(screen_x, screen_y, 2.0),
                 Creature,
                 GridPosition { x: baby_x, y: baby_y },
-                MoveTimer(Timer::from_seconds(cfg.base_move_seconds, TimerMode::Repeating)),
+                // Use Baby DNA for Timer
+                MoveTimer(Timer::from_seconds(baby_dna.move_speed_seconds, TimerMode::Repeating)),
                 Hunger(0.0),
-                CreatureStats { sight_range: sc.sight_range, species_id: sid },
+                // Use Baby DNA for stats
+                CreatureStats { sight_range: baby_dna.sight_range, species_id: sid },
                 CreatureBehavior { scared_of_water: behavior_a.scared_of_water, altruistic: behavior_a.altruistic },
                 Age { seconds_alive: 0.0, is_adult: false },
                 History { last_x: baby_x, last_y: baby_y },
+                baby_dna,
+                baby_gen,
+                CreatureName(baby_name),
             ));
 
-            // Apply Cooldowns
             let cd = sc.reproduction_cooldown_seconds;
             commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(cd, TimerMode::Once)));
             commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(cd, TimerMode::Once)));
@@ -1974,5 +2079,54 @@ fn set_field_f32(cfg: &mut SimulationConfig, field: ConfigField, val: f32) {
         ConfigField::SheepAdultSeconds => cfg.s_mut(0).adult_seconds = val.clamp(1.0, 600.0),
         ConfigField::WolfAdultSeconds => cfg.s_mut(1).adult_seconds = val.clamp(1.0, 600.0),
         _ => {}
+    }
+}
+
+fn generate_name() -> String {
+    let vowels = ["a", "e", "i", "o", "u", "y", "aa", "ee"];
+    let consonants = ["b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n", "p", "r", "s", "t", "v", "z", "th", "qr"];
+
+    // rand::random::<u32>() guarantees consistency.
+    // We cast to usize for array indexing.
+    let len = 2 + (rand::random::<u32>() % 2);
+    let mut name = String::new();
+
+    for _ in 0..len {
+        let c_idx = (rand::random::<u32>() as usize) % consonants.len();
+        let v_idx = (rand::random::<u32>() as usize) % vowels.len();
+
+        name.push_str(consonants[c_idx]);
+        name.push_str(vowels[v_idx]);
+    }
+
+    // Capitalize first letter
+    let mut chars = name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+fn mutate_dna(dna1: &Dna, dna2: &Dna) -> Dna {
+    // 1. Average
+    let avg_speed = (dna1.move_speed_seconds + dna2.move_speed_seconds) / 2.0;
+    let avg_meta = (dna1.metabolism_rate + dna2.metabolism_rate) / 2.0;
+    let avg_sight = (dna1.sight_range + dna2.sight_range) as f32 / 2.0;
+    let avg_size = (dna1.size_multiplier + dna2.size_multiplier) / 2.0;
+
+    // 2. Mutate (variance)
+    // +/- 10% mutation rate usually works well
+    let mutation_strength = 0.10;
+
+    let rand_factor = |val: f32| -> f32 {
+        let variance = val * mutation_strength;
+        val + (rand::random::<f32>() * variance * 2.0) - variance
+    };
+
+    Dna {
+        move_speed_seconds: rand_factor(avg_speed).clamp(0.05, 5.0),
+        metabolism_rate: rand_factor(avg_meta).clamp(0.5, 20.0),
+        sight_range: rand_factor(avg_sight).round() as i32,
+        size_multiplier: rand_factor(avg_size).clamp(0.5, 2.0),
     }
 }
