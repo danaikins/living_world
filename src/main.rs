@@ -100,6 +100,12 @@ struct History {
     last_y: i32,
 }
 
+#[derive(Component)]
+struct Digesting; // State 1: Immobile, waiting for hunger > 0
+
+#[derive(Component)]
+struct Overfed(Timer); // State 2: Slow movement for 5 ticks
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -291,7 +297,17 @@ fn move_creatures(
         // P0: Snapshot Query
         Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
         // P1: Movement Query (Added History)
-        Query<(Entity, &mut GridPosition, &mut MoveTimer, &CreatureBehavior, &CreatureStats, Option<&ReproductionCooldown>, &mut History), (With<Creature>, Without<Dead>)>
+        Query<(
+            Entity,
+            &mut GridPosition,
+            &mut MoveTimer,
+            &CreatureBehavior,
+            &CreatureStats,
+            Option<&ReproductionCooldown>,
+            Option<&Digesting>,
+            Option<&Overfed>,
+            &mut History
+        ), (With<Creature>, Without<Dead>)>
     )>,
     q_water: Query<&Tile, With<Water>>,
 ) {
@@ -303,9 +319,35 @@ fn move_creatures(
     }
 
     // 2. MOVEMENT PASS
-    for (my_entity, mut my_pos, mut timer, behavior, my_stats, cooldown, mut history) in param_set.p1().iter_mut() {
+    for (
+        my_entity,
+        mut my_pos,
+        mut timer,
+        behavior,
+        my_stats,
+        cooldown,
+        digesting,
+        overfed,
+        mut history
+    ) in param_set.p1().iter_mut()  {
 
         let target_duration = if cooldown.is_some() { 0.5 } else { 0.2 };
+        timer.0.set_duration(std::time::Duration::from_secs_f32(target_duration));
+        timer.0.tick(time.delta());
+
+        if digesting.is_some() {
+            // STOP MOVING completely
+            continue;
+        }
+
+        let base_duration = 0.2;
+        let mut target_duration = if cooldown.is_some() { 0.5 } else { base_duration };
+
+        if overfed.is_some() {
+            // 15% speed = Time takes 100/15 ~= 6.6x longer
+            target_duration = base_duration * 6.6;
+        }
+
         timer.0.set_duration(std::time::Duration::from_secs_f32(target_duration));
         timer.0.tick(time.delta());
 
@@ -484,75 +526,75 @@ fn plant_growth_system(
 fn creature_state_update(
     mut commands: Commands,
     time: Res<Time>,
-    // ADDED: CreatureStats to the query so we know which species it is
-    mut q_creatures: Query<(Entity, &mut Hunger, &mut Sprite, &mut Age, Option<&mut ReproductionCooldown>, &CreatureStats), (With<Creature>, Without<Dead>)>,
+    // The Query includes Option<&Digesting>
+    mut q_creatures: Query<(Entity, &mut Hunger, &mut Sprite, &mut Age, Option<&mut ReproductionCooldown>, &CreatureStats, Option<&Digesting>, Option<&mut Overfed>), (With<Creature>, Without<Dead>)>,
 ) {
     let dt = time.delta().as_secs_f32();
     let current_time = time.elapsed_secs();
 
-    for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt, stats) in q_creatures.iter_mut() {
+    // MAKE SURE 'digesting' IS IN THIS LIST ↓
+    for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt, stats, digesting, mut overfed_opt) in q_creatures.iter_mut() {
 
         // 1. Growth & Size
         age.seconds_alive += dt;
-        if !age.is_adult && age.seconds_alive > 20.0 {
-            age.is_adult = true;
-        }
+        if !age.is_adult && age.seconds_alive > 20.0 { age.is_adult = true; }
 
-        // Wolves are naturally larger (Adult 22 vs 20)
         let base_size = if stats.species_id == 1 { 22.0 } else { 20.0 };
-        let baby_size = base_size / 2.0;
-
-        let target_scale = if age.is_adult { base_size } else { baby_size };
+        let target_scale = if age.is_adult { base_size } else { base_size / 2.0 };
         sprite.custom_size = Some(Vec2::new(target_scale, target_scale));
 
-        // 2. Hunger Burn
-        // let burn_rate = if age.is_adult { 3.3 } else { 1.65 };
-        // hunger.0 += burn_rate * dt;
-        let base_burn = if age.is_adult { 3.3 } else { 1.65 };
-
-        // Wolves burn 33% faster
-        let final_burn = if stats.species_id == 1 { base_burn * 1.33 } else { base_burn };
-
+        let burn_rate = if age.is_adult { 3.3 } else { 1.65 };
+        let final_burn = if stats.species_id == 1 { burn_rate * 1.5 } else { burn_rate };
         hunger.0 += final_burn * dt;
 
-        // 3. Cooldown Logic
-        let mut on_cooldown = false;
-        if let Some(ref mut timer) = cooldown_opt {
-            timer.0.tick(time.delta());
-            on_cooldown = true;
-            if timer.0.is_finished() {
-                commands.entity(entity).remove::<ReproductionCooldown>();
-                on_cooldown = false;
+        // 2. DIGESTION LOGIC
+        if digesting.is_some() {
+            // Visual: Dark while digesting
+            sprite.color = Color::srgb(0.2, 0.1, 0.05);
+
+            // Burn off the "Overheal" (Waiting for hunger to reach 0.0)
+            if hunger.0 >= 0.0 {
+                commands.entity(entity).remove::<Digesting>();
+                // Enter Overfed state (Slow movement)
+                commands.entity(entity).insert(Overfed(Timer::from_seconds(5.0, TimerMode::Once)));
             }
         }
+        else if let Some(ref mut overfed_timer) = overfed_opt {
+            // Visual: Greenish tint
+            sprite.color = Color::srgb(0.4, 0.3, 0.1);
 
-        // 4. Visuals (Color)
-        if on_cooldown {
-            // Pulse Purple/Pink
-            let pulse = (current_time * 5.0).sin().abs();
-            let r = 0.5 + (0.5 * pulse);
-            let b = 1.0 - (0.5 * pulse);
-            sprite.color = Color::srgb(r, 0.0, b);
-        } else {
-            // SPECIES COLOR LOGIC
-            if stats.species_id == 0 {
-                // SHEEP: White -> Yellow -> Red
-                if hunger.0 > 90.0 { sprite.color = Color::srgb(1.0, 0.0, 0.0); }
-                else if hunger.0 > 50.0 { sprite.color = Color::srgb(1.0, 1.0, 0.0); }
-                else { sprite.color = Color::srgb(1.0, 1.0, 1.0); }
+            overfed_timer.0.tick(time.delta());
+            if overfed_timer.0.is_finished() {
+                commands.entity(entity).remove::<Overfed>();
+            }
+        }
+        else {
+            // Standard Colors
+            if cooldown_opt.is_some() {
+                let pulse = (current_time * 5.0).sin().abs();
+                sprite.color = Color::srgb(0.5 + 0.5 * pulse, 0.0, 1.0 - 0.5 * pulse);
             } else {
-                // WOLF: Brown -> Orange -> Red
-                if hunger.0 > 90.0 {
-                    sprite.color = Color::srgb(1.0, 0.0, 0.0); // Critical Red
-                } else if hunger.0 > 50.0 {
-                    sprite.color = Color::srgb(0.8, 0.4, 0.0); // Hungry Orange
+                if stats.species_id == 0 {
+                    // Sheep
+                    if hunger.0 > 90.0 { sprite.color = Color::srgb(1.0, 0.0, 0.0); }
+                    else if hunger.0 > 50.0 { sprite.color = Color::srgb(1.0, 1.0, 0.0); }
+                    else { sprite.color = Color::srgb(1.0, 1.0, 1.0); }
                 } else {
-                    sprite.color = Color::srgb(0.4, 0.2, 0.1); // Happy Brown
+                    // Wolf
+                    if hunger.0 > 90.0 { sprite.color = Color::srgb(1.0, 0.0, 0.0); }
+                    else if hunger.0 > 50.0 { sprite.color = Color::srgb(0.8, 0.4, 0.0); }
+                    else { sprite.color = Color::srgb(0.4, 0.2, 0.1); }
                 }
             }
         }
 
-        // 5. Starvation
+        // 3. Cooldown
+        if let Some(ref mut timer) = cooldown_opt {
+            timer.0.tick(time.delta());
+            if timer.0.is_finished() { commands.entity(entity).remove::<ReproductionCooldown>(); }
+        }
+
+        // 4. Starvation
         if hunger.0 >= 100.0 {
             commands.entity(entity).insert(Dead);
         }
@@ -562,14 +604,17 @@ fn creature_state_update(
 // SYSTEM 2: Handling Eating (Interactions with Plants)
 fn creature_eating(
     mut commands: Commands,
-    mut q_creatures: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &CreatureBehavior), (With<Creature>, Without<Dead>)>,
+    mut q_creatures: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &CreatureBehavior, Option<&Digesting>), (With<Creature>, Without<Dead>)>,
     q_plants: Query<(Entity, &GridPosition), (With<Plant>, Without<Dead>)>,
     // Read-only access for altruism check
     q_all_creatures: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
 ) {
     for (plant_entity, plant_pos) in q_plants.iter() {
-        for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior) in q_creatures.iter_mut() {
+        for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior, digesting) in q_creatures.iter_mut() {
+
+            // Quick checks to skip unnecessary processing
             if my_stats.species_id == 1 { continue; }
+            if digesting.is_some() { continue; }
 
             if my_pos.x == plant_pos.x && my_pos.y == plant_pos.y {
 
@@ -613,13 +658,15 @@ fn creature_eating(
 // We use 'iter_combinations' to check every unique pair of creatures safely
 fn creature_reproduction(
     mut commands: Commands,
-    q_creatures: Query<(Entity, &GridPosition, &Age, &CreatureStats, &CreatureBehavior, Option<&ReproductionCooldown>), (With<Creature>, Without<Dead>)>,
+    q_creatures: Query<(Entity, &GridPosition, &Age, &CreatureStats, &CreatureBehavior, Option<&ReproductionCooldown>, Option<&Digesting>, Option<&Overfed>), (With<Creature>, Without<Dead>)>,
 ) {
-    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a),
-    (entity_b, pos_b, age_b, stats_b, _, cooldown_b)] in q_creatures.iter_combinations()
+    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, digest_a, fed_a),
+    (entity_b, pos_b, age_b, stats_b, _, cooldown_b, digest_b, fed_b)] in q_creatures.iter_combinations()
     {
         if !age_a.is_adult || !age_b.is_adult { continue; }
         if cooldown_a.is_some() || cooldown_b.is_some() { continue; }
+        if digest_a.is_some() || fed_a.is_some() { continue; }
+        if digest_b.is_some() || fed_b.is_some() { continue; }
         if stats_a.species_id != stats_b.species_id { continue; }
 
         let dist = (pos_a.x - pos_b.x).abs() + (pos_a.y - pos_b.y).abs();
@@ -841,15 +888,22 @@ fn predator_hunting_system(
     mut q_wolves: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats), (With<Creature>, Without<Dead>)>,
     q_sheep: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
 ) {
-    for (_wolf_entity, wolf_pos, mut wolf_hunger, wolf_stats) in q_wolves.iter_mut() {
+    for (wolf_entity, wolf_pos, mut wolf_hunger, wolf_stats) in q_wolves.iter_mut() {
         if wolf_stats.species_id != 1 { continue; }
 
         for (sheep_entity, sheep_pos, sheep_stats) in q_sheep.iter() {
             if sheep_stats.species_id != 0 { continue; }
 
             if wolf_pos.x == sheep_pos.x && wolf_pos.y == sheep_pos.y {
-                // Eat
-                wolf_hunger.0 = 0.0;
+
+                // --- CHANGED LOGIC ---
+                // 1. Overhealed: Set hunger to -5.0 (5 points "extra" health)
+                wolf_hunger.0 = -5.0;
+
+                // 2. Digesting State: Freeze the wolf
+                commands.entity(wolf_entity).insert(Digesting);
+
+                // 3. Kill Sheep
                 commands.entity(sheep_entity).insert(Dead);
 
                 // Blood FX
@@ -862,23 +916,10 @@ fn predator_hunting_system(
                     GridPosition { x: wolf_pos.x, y: wolf_pos.y },
                 ));
 
-                println!("Wolf ate a Sheep!");
+                println!("Wolf is gorging!");
 
-                // Reproduction (Brown Baby)
-                if rand::random::<f32>() < 0.15 {
-                    commands.spawn((
-                        Sprite::from_color(Color::srgb(0.4, 0.2, 0.1), Vec2::new(15.0, 15.0)),
-                        Transform::from_xyz(screen_x, screen_y, 2.0),
-                        Creature,
-                        GridPosition { x: wolf_pos.x, y: wolf_pos.y },
-                        MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
-                        Hunger(0.0),
-                        CreatureStats { sight_range: 10, species_id: 1 },
-                        CreatureBehavior { scared_of_water: true, altruistic: false },
-                        Age { seconds_alive: 0.0, is_adult: false },
-                    ));
-                    println!("Wolf born!");
-                }
+                // Note: Reproduction check removed here.
+                // We shouldn't spawn babies while face-deep in a sheep.
                 break;
             }
         }
