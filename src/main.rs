@@ -1,11 +1,157 @@
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow; // Needed to get mouse coordinates
+use bevy::window::PrimaryWindow;
+use bevy::ui::ComputedNode;
+use bevy::input::keyboard::{KeyboardInput, Key};
+use bevy::ecs::prelude::ChildSpawnerCommands;
 use std::collections::HashMap;
 
 // Constants
 const TILE_WIDTH: f32 = 64.0;
 const TILE_HEIGHT: f32 = 32.0;
 const MAP_SIZE: i32 = 20;
+
+// ========================
+// 1) CONFIG RESOURCE
+// =========================
+#[derive(Resource, Clone)]
+struct SimulationConfig {
+    // Map / tiles
+    map_size: i32,
+    tile_w: f32,
+    tile_h: f32,
+
+    // World / growth
+    plant_spawn_chance_per_tick: f32,
+    soil_exhaust_seconds_after_eat: f32,
+    blood_fx_seconds: f32,
+
+    // Movement
+    base_move_seconds: f32,
+    reproduction_move_seconds: f32,
+    overfed_move_multiplier: f32,
+
+    // Hunger
+    hunger_starve_threshold: f32,
+    sheep_hunger_burn_adult: f32,
+    sheep_hunger_burn_baby: f32,
+    wolf_hunger_burn_adult: f32,
+    wolf_hunger_burn_baby: f32,
+
+    // Eating rules
+    eat_skip_if_hunger_below: f32, // "already full" threshold
+
+    // Wolf berry mechanics
+    wolf_berry_stun_ticks: u32,
+
+    // Wolf fruit preference weights when very low health (hunger >= 70)
+    wolf_low_health_hunger_threshold: f32,
+    wolf_low_health_weight_fruit: i32,
+    wolf_low_health_weight_meat: i32,
+
+    // Species configs (keyed by species_id)
+    species: HashMap<u32, SpeciesConfig>,
+
+    // Debug UI
+    debug_panel_enabled: bool,
+}
+
+#[derive(Clone)]
+struct SpeciesConfig {
+    name: &'static str,
+    starting_count: u32,
+
+    // Baby->Adult timing
+    adult_seconds: f32,
+
+    // Reproduction
+    reproduction_chance: f32, // 0..1
+    reproduction_cooldown_seconds: f32,
+
+    // Sight
+    sight_range: i32,
+}
+
+impl Default for SimulationConfig {
+    fn default() -> Self {
+        let mut species = HashMap::new();
+
+        // Sheep: species_id = 0
+        species.insert(
+            0,
+            SpeciesConfig {
+                name: "Sheep",
+                starting_count: 12,          // CONFIG: starting sheep
+                adult_seconds: 10.0,         // CONFIG: sheep mature faster
+                reproduction_chance: 0.10,   // CONFIG
+                reproduction_cooldown_seconds: 30.0, // CONFIG: reduced cooldown
+                sight_range: 8,              // CONFIG
+            },
+        );
+
+        // Wolves: species_id = 1
+        species.insert(
+            1,
+            SpeciesConfig {
+                name: "Wolves",
+                starting_count: 4,           // CONFIG: starting wolves
+                adult_seconds: 20.0,         // CONFIG
+                reproduction_chance: 0.10,   // CONFIG (same as sheep for now)
+                reproduction_cooldown_seconds: 70.0, // CONFIG
+                sight_range: 10,             // CONFIG
+            },
+        );
+
+        Self {
+            // Map / tiles (mirror your constants)
+            map_size: 20,
+            tile_w: 64.0,
+            tile_h: 32.0,
+
+            // Growth
+            plant_spawn_chance_per_tick: 0.05,
+            soil_exhaust_seconds_after_eat: 10.0,
+            blood_fx_seconds: 30.0,
+
+            // Movement
+            base_move_seconds: 0.2,
+            reproduction_move_seconds: 0.5,
+            overfed_move_multiplier: 6.6,
+
+            // Hunger
+            hunger_starve_threshold: 100.0,
+            sheep_hunger_burn_adult: 3.3,
+            sheep_hunger_burn_baby: 1.65,
+            wolf_hunger_burn_adult: 3.3 * 1.5,
+            wolf_hunger_burn_baby: 1.65 * 1.5,
+
+            // Eating
+            eat_skip_if_hunger_below: 5.0,
+
+            // Wolf berry stun
+            wolf_berry_stun_ticks: 2,
+
+            // Low-health weights for wolves
+            wolf_low_health_hunger_threshold: 70.0,
+            wolf_low_health_weight_fruit: 80,
+            wolf_low_health_weight_meat: 50,
+
+            // Species
+            species,
+
+            // Debug UI
+            debug_panel_enabled: true,
+        }
+    }
+}
+
+impl SimulationConfig {
+    fn s(&self, id: u32) -> &SpeciesConfig {
+        self.species.get(&id).expect("Missing SpeciesConfig")
+    }
+    fn s_mut(&mut self, id: u32) -> &mut SpeciesConfig {
+        self.species.get_mut(&id).expect("Missing SpeciesConfig")
+    }
+}
 
 // --- COMPONENTS ---
 // This tags an entity as being a "Tile" at a specific grid location
@@ -131,6 +277,54 @@ struct SpeciesStatsWolfText;
 #[derive(Component)]
 struct BerryStun(Timer); // short immobile state after eating berries
 
+#[derive(Component)]
+struct DebugPanelRoot;
+
+#[derive(Component)]
+struct DebugPanelVisible;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ConfigField {
+    PlantSpawnChance,
+    SheepStartCount,
+    WolfStartCount,
+    SheepAdultSeconds,
+    WolfAdultSeconds,
+}
+
+#[derive(Component)]
+struct Slider {
+    field: ConfigField,
+    min: f32,
+    max: f32,
+}
+
+#[derive(Component)]
+struct SliderKnob {
+    field: ConfigField,
+}
+
+#[derive(Component)]
+struct SliderValueText {
+    field: ConfigField,
+}
+
+#[derive(Component)]
+struct TextBox {
+    field: ConfigField,
+}
+
+#[derive(Component)]
+struct TextBoxText {
+    field: ConfigField,
+}
+
+#[derive(Resource, Default)]
+struct TextBoxFocus {
+    active: Option<ConfigField>,
+    buffer: String,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -141,14 +335,17 @@ fn main() {
             }),
             ..default()
         }))
-        // A1) Guaranteed resource init (fixes the panic)
+        .insert_resource(SimulationConfig::default())
         .insert_resource(PopulationStats::default())
-        .insert_resource(GameStats { days: 0.0 }) // optional: also move GameStats here if you want
+        .insert_resource(GameStats { days: 0.0 })
 
-        // B) Chain Startup systems so they're ordered
-        .add_systems(Startup, (setup, spawn_map, setup_chart).chain())
+        // Order startup so config exists before spawn_map
+        .add_systems(Startup, (setup, spawn_map, setup_chart, setup_debug_panel).chain())
 
         .add_systems(Update, (
+            toggle_debug_panel,
+            debug_panel_visibility,
+
             cursor_system,
             move_creatures,
             sync_creature_visuals,
@@ -157,15 +354,18 @@ fn main() {
             reaper_system,
             handle_exhaustion,
             update_stats_ui,
-            update_species_stats_ui, // <-- make sure this is added
+            update_species_stats_ui,
             update_chart_ui,
             creature_state_update,
             creature_eating,
             predator_hunting_system,
             creature_reproduction,
+            debug_slider_system,
+            debug_textbox_system,
         ))
         .run();
 }
+
 
 fn setup(mut commands: Commands) {
     // 1. Initialize Game Stats Resource (Day 0)
@@ -257,27 +457,32 @@ fn setup(mut commands: Commands) {
         });
 }
 
-fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
-    // 1. Spawn Ground
-    for x in -MAP_SIZE..MAP_SIZE {
-        for y in -MAP_SIZE..MAP_SIZE {
-            let screen_x = (x - y) as f32 * (TILE_WIDTH / 2.0);
-            let screen_y = (x + y) as f32 * (TILE_HEIGHT / 2.0);
+fn spawn_map(
+    mut commands: Commands,
+    mut pop: ResMut<PopulationStats>,
+    cfg: Res<SimulationConfig>,
+) {
+    let map_size = cfg.map_size;
+    let tile_w = cfg.tile_w;
+    let tile_h = cfg.tile_h;
+
+    // Ground
+    for x in -map_size..map_size {
+        for y in -map_size..map_size {
+            let screen_x = (x - y) as f32 * (tile_w / 2.0);
+            let screen_y = (x + y) as f32 * (tile_h / 2.0);
             commands.spawn((
-                Sprite::from_color(
-                    Color::srgb(0.3, 0.5, 0.3),
-                    Vec2::new(TILE_WIDTH - 2.0, TILE_HEIGHT - 2.0),
-                ),
+                Sprite::from_color(Color::srgb(0.3, 0.5, 0.3), Vec2::new(tile_w - 2.0, tile_h - 2.0)),
                 Transform::from_xyz(screen_x, screen_y, 0.0),
                 Tile { x, y },
             ));
         }
     }
 
-    // Spawn Sheep (start as babies; count as born + total ever)
-    for i in 0..8 {
-        let species_id = 0_u32;
-        let entry = stats.species.entry(species_id).or_default();
+    // Starting sheep (born + total_ever; start as babies)
+    let sheep_cfg = cfg.s(0);
+    for i in 0..(sheep_cfg.starting_count as i32) {
+        let entry = pop.species.entry(0).or_default();
         entry.born += 1;
         entry.total_ever += 1;
 
@@ -286,20 +491,23 @@ fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
             Transform::from_xyz(0.0, 0.0, 2.0),
             Creature,
             GridPosition { x: i, y: i },
-            MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
+            MoveTimer(Timer::from_seconds(cfg.base_move_seconds, TimerMode::Repeating)),
             Hunger(0.0),
-            CreatureStats { sight_range: 8, species_id },
+            CreatureStats { sight_range: sheep_cfg.sight_range, species_id: 0 },
             CreatureBehavior { scared_of_water: true, altruistic: true },
-            Age { seconds_alive: 0.0, is_adult: false }, // <-- BABY
+            Age { seconds_alive: 0.0, is_adult: false },
             History { last_x: i, last_y: i },
         ));
     }
 
-    // Spawn Wolves (start as babies; count as born + total ever)
-    let wolf_coords = vec![(-5, -5), (5, -5)];
-    for (wx, wy) in wolf_coords {
-        let species_id = 1_u32;
-        let entry = stats.species.entry(species_id).or_default();
+    // Starting wolves (born + total_ever; start as babies)
+    // Spread 4 wolves in a simple pattern
+    let wolf_cfg = cfg.s(1);
+    let wolf_coords = vec![(-6, -6), (-4, -6), (4, -6), (6, -6)];
+    for idx in 0..(wolf_cfg.starting_count.min(wolf_coords.len() as u32) as usize) {
+        let (wx, wy) = wolf_coords[idx];
+
+        let entry = pop.species.entry(1).or_default();
         entry.born += 1;
         entry.total_ever += 1;
 
@@ -308,11 +516,11 @@ fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
             Transform::from_xyz(0.0, 0.0, 2.0),
             Creature,
             GridPosition { x: wx, y: wy },
-            MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
+            MoveTimer(Timer::from_seconds(cfg.base_move_seconds, TimerMode::Repeating)),
             Hunger(0.0),
-            CreatureStats { sight_range: 10, species_id },
+            CreatureStats { sight_range: wolf_cfg.sight_range, species_id: 1 },
             CreatureBehavior { scared_of_water: true, altruistic: false },
-            Age { seconds_alive: 0.0, is_adult: false }, // <-- BABY
+            Age { seconds_alive: 0.0, is_adult: false },
             History { last_x: wx, last_y: wy },
         ));
     }
@@ -390,6 +598,7 @@ fn cursor_system(
 fn move_creatures(
     mut commands: Commands,
     time: Res<Time>,
+    cfg: Res<SimulationConfig>,
     mut param_set: ParamSet<(
         Query<(Entity, &GridPosition, &CreatureStats, &Age), (With<Creature>, Without<Dead>)>,
         Query<(
@@ -404,13 +613,12 @@ fn move_creatures(
             Option<&Overfed>,
             Option<&mut BerryStun>,
             &Hunger,
-            &Age
+            &Age,
         ), (With<Creature>, Without<Dead>)>,
         Query<&GridPosition, With<Plant>>,
         Query<&GridPosition, With<Water>>,
     )>,
 ) {
-    // 1) Creature snapshot now includes adulthood
     struct CreatureSnapshot {
         entity: Entity,
         x: i32,
@@ -431,11 +639,9 @@ fn move_creatures(
         })
         .collect();
 
-    // 2) Plant + water snapshots
     let plant_positions: Vec<(i32, i32)> = param_set.p2().iter().map(|p| (p.x, p.y)).collect();
     let water_tiles: Vec<(i32, i32)> = param_set.p3().iter().map(|p| (p.x, p.y)).collect();
 
-    // 3) Mutate creatures
     for (
         my_entity,
         mut my_pos,
@@ -451,54 +657,53 @@ fn move_creatures(
         my_age,
     ) in param_set.p1().iter_mut()
     {
-        // --- BERRY STUN LOGIC ---
+        // --- BERRY STUN: immobile until timer completes ---
         if let Some(mut stun) = berry_stun {
             stun.0.tick(time.delta());
-
-            if !stun.0.is_finished() {
-                // Immobilized for berry digestion
+            if !stun.0.just_finished() {
                 continue;
-            } else {
-                // Stun over
-                commands.entity(my_entity).remove::<BerryStun>();
             }
+            commands.entity(my_entity).remove::<BerryStun>();
         }
 
-        // Timer logic
-        let base_duration = 0.2;
-        let mut target_duration = if cooldown.is_some() { 0.5 } else { base_duration };
-        if overfed.is_some() {
-            target_duration = base_duration * 6.6;
+        // If digesting, no movement
+        if digesting.is_some() {
+            continue;
         }
-        timer.0.set_duration(std::time::Duration::from_secs_f32(target_duration));
+
+        // --- Movement timer (Repeating) ---
+        let mut move_seconds = cfg.base_move_seconds;
+        if cooldown.is_some() {
+            move_seconds = cfg.reproduction_move_seconds;
+        }
+        if overfed.is_some() {
+            move_seconds = cfg.base_move_seconds * cfg.overfed_move_multiplier;
+        }
+
+        timer.0.set_duration(std::time::Duration::from_secs_f32(move_seconds));
         timer.0.tick(time.delta());
 
-        if digesting.is_some() || !timer.0.is_finished() {
+        // ✅ THIS is the important change
+        if !timer.0.just_finished() {
             continue;
         }
 
         let old_x = my_pos.x;
         let old_y = my_pos.y;
 
-        // === TARGET SELECTION ===
+        // === TARGET SELECTION (unchanged from your current logic) ===
         let mut target_pos: Option<(i32, i32)> = None;
-
-        // target_type:
-        // 1 = fruit (plant), 2 = mate, 3 = prey (sheep), 4 = predator (wolf)
-        let mut target_type: i32 = 0;
-        let mut target_weight: i32 = 20; // multiplier for distance delta scoring
+        let mut target_type: i32 = 0;      // 1=fruit, 2=mate, 3=prey, 4=predator
+        let mut target_weight: i32 = 20;
 
         let is_sheep = my_stats.species_id == 0;
         let is_wolf = my_stats.species_id == 1;
 
         let hunger_level = my_hunger.0;
         let is_full = hunger_level <= 10.0;
+        let can_breed = my_age.is_adult && cooldown.is_none() && overfed.is_none();
 
-        let can_breed = my_age.is_adult && cooldown.is_none() && digesting.is_none() && overfed.is_none();
-
-        // ---------- SHEEP LOGIC ----------
         if is_sheep {
-            // Seek mate if full and ready
             if is_full && can_breed {
                 let mut best_dist = 9999;
                 for other in &creature_targets {
@@ -513,7 +718,6 @@ fn move_creatures(
                 }
             }
 
-            // Seek food if hungry
             if target_pos.is_none() && hunger_level > 30.0 {
                 let mut best_dist = 9999;
                 for &(px, py) in &plant_positions {
@@ -528,19 +732,24 @@ fn move_creatures(
             }
         }
 
-        // ---------- PREDATOR / PREY OVERRIDE WITH BABY RULES ----------
-        //
-        // Babies can't attack:
-        // - Wolf babies do not target sheep as prey.
-        //
-        // Not scared of other babies:
-        // - Sheep do NOT treat wolf babies as predators (no flee target).
-        let mut threat_dist = 9999;
+        if is_wolf {
+            if can_breed && hunger_level <= 50.0 {
+                let mut best_dist = 9999;
+                for other in &creature_targets {
+                    if my_entity == other.entity || other.species != 1 { continue; }
+                    if !other.is_adult { continue; }
+                    let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
+                    if dist > 1 && dist < my_stats.sight_range && dist < best_dist {
+                        best_dist = dist;
+                        target_pos = Some((other.x, other.y));
+                        target_type = 2;
+                        target_weight = 60;
+                    }
+                }
+            }
+        }
 
-        // Track best prey target for wolves
-        let mut best_prey: Option<(i32, i32, i32)> = None; // (x, y, dist)
-
-        // Track best predator threat for sheep
+        let mut best_prey: Option<(i32, i32, i32)> = None;
         let mut best_predator: Option<(i32, i32, i32)> = None;
 
         for other in &creature_targets {
@@ -548,73 +757,48 @@ fn move_creatures(
             let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
             if dist >= my_stats.sight_range { continue; }
 
-            // Wolves hunting sheep (only if THIS wolf is adult; prey can be adult or baby)
             if is_wolf && other.species == 0 {
-                if my_age.is_adult {
+                if my_age.is_adult && !(target_type == 2 && hunger_level <= 50.0) {
                     if best_prey.map(|(_,_,d)| dist < d).unwrap_or(true) {
                         best_prey = Some((other.x, other.y, dist));
                     }
                 }
-            }
-            // Sheep fearing wolves (only if the wolf is adult; sheep are not scared of wolf babies)
-            else if is_sheep && other.species == 1 {
+            } else if is_sheep && other.species == 1 {
                 if other.is_adult {
                     if best_predator.map(|(_,_,d)| dist < d).unwrap_or(true) {
                         best_predator = Some((other.x, other.y, dist));
                     }
                 }
             }
-
-            // "aren't scared of other babies" also implies: if both are babies, never treat as threat/target
-            // (handled implicitly above since sheep only fear adult wolves, and wolf babies don't hunt).
         }
 
-        // Apply best predator for sheep
-        if let Some((px, py, dist)) = best_predator {
-            threat_dist = dist;
+        if let Some((px, py, _)) = best_predator {
             target_pos = Some((px, py));
-            target_type = 4;     // flee
+            target_type = 4;
             target_weight = 20;
         }
 
-        // Apply best prey for wolves (only if no flee target set)
-        if target_type == 0 || target_type == 1 || target_type == 2 {
-            if let Some((sx, sy, dist)) = best_prey {
-                threat_dist = dist;
+        if target_type != 2 {
+            if let Some((sx, sy, _)) = best_prey {
                 target_pos = Some((sx, sy));
-                target_type = 3;     // hunt
-                target_weight = 20;  // default hunt weight (can be adjusted below)
+                target_type = 3;
+                target_weight = 20;
             }
         }
 
-        // ---------- WOLF FRUIT FALLBACK + LOW-HEALTH WEIGHTS ----------
-        //
-        // - Baby wolves can eat fruit.
-        // - Adult wolves can eat fruit if hunger <= 30.0.
-        // - If wolf is <= 30% health (hunger >= 70.0), prefer fruit more strongly:
-        //      fruit weight = 80%  => 80
-        //      meat  weight = 50%  => 50
         if is_wolf {
             let can_eat_fruit = !my_age.is_adult || hunger_level <= 30.0 || hunger_level >= 70.0;
-
-            // If wolf is low health, change weights even if meat exists.
-            if hunger_level >= 70.0 {
-                // If we already have a meat target, reduce its pull (50)
-                if target_type == 3 {
-                    target_weight = 50;
-                }
+            if hunger_level >= 70.0 && target_type == 3 {
+                target_weight = 50;
             }
-
-            // If no meat target found, seek fruit (if allowed)
-            if can_eat_fruit && (target_type != 3) {
+            if can_eat_fruit && target_type != 2 && target_type != 3 {
                 let mut best_dist = 9999;
                 for &(px, py) in &plant_positions {
                     let dist = (my_pos.x - px).abs() + (my_pos.y - py).abs();
                     if dist > 0 && dist < my_stats.sight_range && dist < best_dist {
                         best_dist = dist;
                         target_pos = Some((px, py));
-                        target_type = 1; // fruit
-                        // Low health = strong fruit pull
+                        target_type = 1;
                         target_weight = if hunger_level >= 70.0 { 80 } else { 20 };
                     }
                 }
@@ -622,7 +806,7 @@ fn move_creatures(
         }
 
         // === MOVE EVALUATION ===
-        let moves = [(0,1), (0,-1), (-1,0), (1,0)];
+        let moves = [(0, 1), (0, -1), (-1, 0), (1, 0)];
         let mut best_move = (0, 0);
         let mut best_score = -9999_i32;
 
@@ -630,7 +814,8 @@ fn move_creatures(
             let nx = my_pos.x + dx;
             let ny = my_pos.y + dy;
 
-            if nx < -MAP_SIZE || nx >= MAP_SIZE || ny < -MAP_SIZE || ny >= MAP_SIZE {
+            // ✅ Use config map size, not MAP_SIZE
+            if nx < -cfg.map_size || nx >= cfg.map_size || ny < -cfg.map_size || ny >= cfg.map_size {
                 continue;
             }
 
@@ -650,9 +835,7 @@ fn move_creatures(
                 let delta = dist_after - dist_now;
 
                 match target_type {
-                    // toward fruit/mate/prey
                     1 | 2 | 3 => score -= delta * target_weight,
-                    // away from predator
                     4 => score += delta * target_weight,
                     _ => {}
                 }
@@ -713,14 +896,18 @@ fn handle_drowning(
 
 fn plant_growth_system(
     mut commands: Commands,
+    cfg: Res<SimulationConfig>,
     q_tiles: Query<(&Tile, &Sprite), Without<Water>>,
     q_plants: Query<&GridPosition, With<Plant>>,
-    // NEW: Check for exhausted soil
     q_exhausted: Query<&GridPosition, With<ExhaustedSoil>>,
 ) {
-    if rand::random::<f32>() < 0.05 {
-        let x = (rand::random::<i32>().abs() % (MAP_SIZE * 2)) - MAP_SIZE;
-        let y = (rand::random::<i32>().abs() % (MAP_SIZE * 2)) - MAP_SIZE;
+    if rand::random::<f32>() < cfg.plant_spawn_chance_per_tick {
+        let map_size = cfg.map_size;
+        let tile_w = cfg.tile_w;
+        let tile_h = cfg.tile_h;
+
+        let x = (rand::random::<i32>().abs() % (map_size * 2)) - map_size;
+        let y = (rand::random::<i32>().abs() % (map_size * 2)) - map_size;
 
         let mut valid_ground = false;
         for (tile, _sprite) in q_tiles.iter() {
@@ -747,8 +934,8 @@ fn plant_growth_system(
         }
 
         if valid_ground && !occupied {
-            let screen_x = (x - y) as f32 * (TILE_WIDTH / 2.0);
-            let screen_y = (x + y) as f32 * (TILE_HEIGHT / 2.0);
+            let screen_x = (x - y) as f32 * (tile_w / 2.0);
+            let screen_y = (x + y) as f32 * (tile_h / 2.0);
 
             commands.spawn((
                 Sprite::from_color(Color::srgb(0.2, 0.8, 0.2), Vec2::new(15.0, 15.0)),
@@ -764,6 +951,7 @@ fn plant_growth_system(
 fn creature_state_update(
     mut commands: Commands,
     time: Res<Time>,
+    cfg: Res<SimulationConfig>,
     // The Query includes Option<&Digesting>
     mut q_creatures: Query<(Entity, &mut Hunger, &mut Sprite, &mut Age, Option<&mut ReproductionCooldown>, &CreatureStats, Option<&Digesting>, Option<&mut Overfed>), (With<Creature>, Without<Dead>)>,
 ) {
@@ -775,15 +963,30 @@ fn creature_state_update(
 
         // 1. Growth & Size
         age.seconds_alive += dt;
-        if !age.is_adult && age.seconds_alive > 20.0 { age.is_adult = true; }
+        let adult_seconds = cfg.s(stats.species_id).adult_seconds;
+        if !age.is_adult && age.seconds_alive > adult_seconds {
+            age.is_adult = true;
+        }
 
         let base_size = if stats.species_id == 1 { 22.0 } else { 20.0 };
         let target_scale = if age.is_adult { base_size } else { base_size / 2.0 };
         sprite.custom_size = Some(Vec2::new(target_scale, target_scale));
-
+/*
         let burn_rate = if age.is_adult { 3.3 } else { 1.65 };
         let final_burn = if stats.species_id == 1 { burn_rate * 1.5 } else { burn_rate };
         hunger.0 += final_burn * dt;
+
+ */
+
+        // Burn per species + age
+        let burn = match (stats.species_id, age.is_adult) {
+            (0, true) => cfg.sheep_hunger_burn_adult,
+            (0, false) => cfg.sheep_hunger_burn_baby,
+            (1, true) => cfg.wolf_hunger_burn_adult,
+            (1, false) => cfg.wolf_hunger_burn_baby,
+            _ => 3.0,
+        };
+        hunger.0 += burn * dt;
 
         // 2. DIGESTION LOGIC
         if digesting.is_some() {
@@ -849,6 +1052,7 @@ fn creature_state_update(
 // SYSTEM 2: Handling Eating (Interactions with Plants)
 fn creature_eating(
     mut commands: Commands,
+    cfg: Res<SimulationConfig>,
     mut q_creatures: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &CreatureBehavior, &Age, Option<&Digesting>), (With<Creature>, Without<Dead>)>,
     q_plants: Query<(Entity, &GridPosition), (With<Plant>, Without<Dead>)>,
     q_all_creatures: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
@@ -856,6 +1060,10 @@ fn creature_eating(
     for (plant_entity, plant_pos) in q_plants.iter() {
         for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior, my_age, digesting) in q_creatures.iter_mut() {
             if digesting.is_some() { continue; }
+
+            if my_pos.x != plant_pos.x || my_pos.y != plant_pos.y {
+                continue;
+            }
 
             let is_sheep = my_stats.species_id == 0;
             let is_wolf = my_stats.species_id == 1;
@@ -871,7 +1079,7 @@ fn creature_eating(
 
             if my_pos.x == plant_pos.x && my_pos.y == plant_pos.y {
                 // Full check (keep it: no point eating if already essentially full)
-                if my_hunger.0 < 5.0 { continue; }
+                if my_hunger.0 < cfg.eat_skip_if_hunger_below { continue; }
 
                 // Altruism only applies to sheep (wolves ignore altruism)
                 if is_sheep {
@@ -895,19 +1103,20 @@ fn creature_eating(
 
                 // If wolf: apply 2-tick berry stun
                 if my_stats.species_id == 1 {
-                    // 2 ticks = 2 * base MoveTimer duration (0.2s each)
-                    commands.entity(my_entity).insert(BerryStun(
-                        Timer::from_seconds(0.4, TimerMode::Once),
-                    ));
+                    let stun_seconds = cfg.base_move_seconds * (cfg.wolf_berry_stun_ticks as f32);
+                    commands.entity(my_entity).insert(BerryStun(Timer::from_seconds(stun_seconds, TimerMode::Once)));
                 }
 
                 // Spawn Exhausted Soil (existing)
-                let screen_x = (my_pos.x - my_pos.y) as f32 * (TILE_WIDTH / 2.0);
-                let screen_y = (my_pos.x + my_pos.y) as f32 * (TILE_HEIGHT / 2.0);
+                let tile_w = cfg.tile_w;
+                let tile_h = cfg.tile_h;
+                let screen_x = (my_pos.x - my_pos.y) as f32 * (tile_w / 2.0);
+                let screen_y = (my_pos.x + my_pos.y) as f32 * (tile_h / 2.0);
+
                 commands.spawn((
                     Sprite::from_color(Color::srgb(0.5, 0.25, 0.0), Vec2::new(10.0, 40.0)),
                     Transform::from_xyz(screen_x, screen_y, 0.1).with_rotation(Quat::from_rotation_z(0.785)),
-                    ExhaustedSoil(Timer::from_seconds(10.0, TimerMode::Once)),
+                    ExhaustedSoil(Timer::from_seconds(cfg.soil_exhaust_seconds_after_eat, TimerMode::Once)),
                     GridPosition { x: my_pos.x, y: my_pos.y },
                 ));
 
@@ -921,25 +1130,12 @@ fn creature_eating(
 // We use 'iter_combinations' to check every unique pair of creatures safely
 fn creature_reproduction(
     mut commands: Commands,
+    cfg: Res<SimulationConfig>,
     mut pop: ResMut<PopulationStats>,
-    q_creatures: Query<
-        (
-            Entity,
-            &GridPosition,
-            &Age,
-            &CreatureStats,
-            &CreatureBehavior,
-            Option<&ReproductionCooldown>,
-            Option<&Digesting>,
-            Option<&Overfed>,
-        ),
-        (With<Creature>, Without<Dead>),
-    >,
+    q_creatures: Query<(Entity, &GridPosition, &Age, &CreatureStats, &CreatureBehavior, Option<&ReproductionCooldown>, Option<&Digesting>, Option<&Overfed>), (With<Creature>, Without<Dead>)>,
 ) {
-    for [
-    (entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, digest_a, fed_a),
-    (entity_b, pos_b, age_b, stats_b, _, cooldown_b, digest_b, fed_b),
-    ] in q_creatures.iter_combinations()
+    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, digest_a, fed_a),
+    (entity_b, pos_b, age_b, stats_b, _,          cooldown_b, digest_b, fed_b)] in q_creatures.iter_combinations()
     {
         if !age_a.is_adult || !age_b.is_adult { continue; }
         if cooldown_a.is_some() || cooldown_b.is_some() { continue; }
@@ -950,51 +1146,41 @@ fn creature_reproduction(
         let dist = (pos_a.x - pos_b.x).abs() + (pos_a.y - pos_b.y).abs();
         if dist > 1 { continue; }
 
-        if rand::random::<f32>() < 0.10 {
+        let sid = stats_a.species_id;
+        let sc = cfg.s(sid);
+
+        if rand::random::<f32>() < sc.reproduction_chance {
+            // stats bump
+            let entry = pop.species.entry(sid).or_default();
+            entry.born += 1;
+            entry.total_ever += 1;
+
+            // spawn baby (unchanged except timing knobs if you want)
             let baby_x = pos_a.x;
             let baby_y = pos_a.y;
 
-            let screen_x = (baby_x - baby_y) as f32 * (TILE_WIDTH / 2.0);
-            let screen_y = (baby_x + baby_y) as f32 * (TILE_HEIGHT / 2.0);
-
-            let species_id = stats_a.species_id;
-
-            // NEW: stats bump
-            let entry = pop.species.entry(species_id).or_default();
-            entry.born += 1;
-            entry.total_ever += 1;
+            let tile_w = cfg.tile_w;
+            let tile_h = cfg.tile_h;
+            let screen_x = (baby_x - baby_y) as f32 * (tile_w / 2.0);
+            let screen_y = (baby_x + baby_y) as f32 * (tile_h / 2.0);
 
             commands.spawn((
                 Sprite::from_color(Color::srgb(1.0, 1.0, 1.0), Vec2::new(10.0, 10.0)),
                 Transform::from_xyz(screen_x, screen_y, 2.0),
                 Creature,
                 GridPosition { x: baby_x, y: baby_y },
-                MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
+                MoveTimer(Timer::from_seconds(cfg.base_move_seconds, TimerMode::Repeating)),
                 Hunger(0.0),
-                CreatureStats { sight_range: stats_a.sight_range, species_id },
+                CreatureStats { sight_range: sc.sight_range, species_id: sid },
                 CreatureBehavior { scared_of_water: behavior_a.scared_of_water, altruistic: behavior_a.altruistic },
                 Age { seconds_alive: 0.0, is_adult: false },
                 History { last_x: baby_x, last_y: baby_y },
             ));
 
-            let cooldown_seconds = if species_id == 0 {
-                20.0 // Sheep reproduce faster
-            } else {
-                40.0 // Wolves reproduce slower
-            };
-
-            commands.entity(entity_a).insert(ReproductionCooldown(
-                Timer::from_seconds(cooldown_seconds, TimerMode::Once),
-            ));
-            commands.entity(entity_b).insert(ReproductionCooldown(
-                Timer::from_seconds(cooldown_seconds, TimerMode::Once),
-            ));
-
-            if species_id == 0 {
-                println!("A new sheep is born!");
-            } else {
-                println!("A new wolf is born!");
-            }
+            // CONFIG: per-species cooldown
+            let cd = sc.reproduction_cooldown_seconds;
+            commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(cd, TimerMode::Once)));
+            commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(cd, TimerMode::Once)));
         }
     }
 }
@@ -1254,5 +1440,413 @@ fn predator_hunting_system(
                 break;
             }
         }
+    }
+}
+
+fn setup_debug_panel(mut commands: Commands) {
+    commands.insert_resource(TextBoxFocus::default());
+
+    commands
+        .spawn((
+            DebugPanelRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(10.0),
+                bottom: Val::Px(10.0),
+                width: Val::Px(380.0),
+                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(10.0),
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("Debug Controls (F1)"),
+                TextFont { font_size: 18.0, ..default() },
+                TextColor(Color::srgb(1.0, 1.0, 1.0)),
+            ));
+
+            // --- Row: Plant spawn chance slider ---
+            debug_slider_row(
+                p,
+                "Plant Spawn Chance",
+                ConfigField::PlantSpawnChance,
+                0.0,
+                0.25,
+            );
+
+            // --- Row: Sheep start count textbox ---
+            debug_textbox_row(p, "Sheep Start Count", ConfigField::SheepStartCount);
+
+            // --- Row: Wolf start count textbox ---
+            debug_textbox_row(p, "Wolf Start Count", ConfigField::WolfStartCount);
+
+            // --- Row: Sheep adult seconds slider ---
+            debug_slider_row(
+                p,
+                "Sheep Adult Seconds",
+                ConfigField::SheepAdultSeconds,
+                1.0,
+                60.0,
+            );
+
+            // --- Row: Wolf adult seconds slider ---
+            debug_slider_row(
+                p,
+                "Wolf Adult Seconds",
+                ConfigField::WolfAdultSeconds,
+                1.0,
+                60.0,
+            );
+        });
+}
+
+fn debug_slider_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    field: ConfigField,
+    min: f32,
+    max: f32,
+) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont { font_size: 14.0, ..default() },
+                TextColor(Color::srgb(1.0, 1.0, 1.0)),
+            ));
+
+            row.spawn((
+                Node {
+                    height: Val::Px(24.0),
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(10.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+            ))
+                .with_children(|line| {
+                    // Track
+                    line.spawn((
+                        Slider { field, min, max },
+                        Node {
+                            width: Val::Px(220.0),
+                            height: Val::Px(10.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                        Interaction::default(),
+                    ))
+                        .with_children(|track| {
+                            // Knob
+                            track.spawn((
+                                SliderKnob { field },
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: Val::Px(0.0),
+                                    top: Val::Px(-4.0),
+                                    width: Val::Px(12.0),
+                                    height: Val::Px(18.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.8, 0.8, 0.8)),
+                            ));
+                        });
+
+                    // Value text
+                    line.spawn((
+                        SliderValueText { field },
+                        Text::new("0.00"),
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+                    ));
+                });
+        });
+}
+
+fn debug_textbox_row(parent: &mut ChildSpawnerCommands, label: &str, field: ConfigField) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont { font_size: 14.0, ..default() },
+                TextColor(Color::srgb(1.0, 1.0, 1.0)),
+            ));
+
+            row.spawn((
+                TextBox { field },
+                Node {
+                    width: Val::Px(140.0),
+                    height: Val::Px(26.0),
+                    padding: UiRect::horizontal(Val::Px(6.0)),
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                Interaction::default(),
+            ))
+                .with_children(|tb| {
+                    tb.spawn((
+                        TextBoxText { field },
+                        Text::new(""),
+                        TextFont { font_size: 14.0, ..default() },
+                        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+                    ));
+                });
+        });
+}
+
+fn toggle_debug_panel(keys: Res<ButtonInput<KeyCode>>, mut cfg: ResMut<SimulationConfig>) {
+    if keys.just_pressed(KeyCode::F1) {
+        cfg.debug_panel_enabled = !cfg.debug_panel_enabled;
+    }
+}
+
+fn debug_panel_visibility(
+    cfg: Res<SimulationConfig>,
+    mut q: Query<&mut Visibility, With<DebugPanelRoot>>,
+) {
+    // In your Bevy build, single_mut() returns Result<Mut<_>, QuerySingleError>
+    let Ok(mut v) = q.single_mut() else { return; };
+
+    *v = if cfg.debug_panel_enabled {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+}
+
+// ---- Slider behavior: click+drag on track ----
+fn val_to_px(v: Val) -> Option<f32> {
+    match v {
+        Val::Px(px) => Some(px),
+        _ => None, // Percent/Vw/Vh/Auto etc. not handled here
+    }
+}
+
+fn debug_slider_system(
+    q_window: Query<&Window, With<PrimaryWindow>>,
+    mut cfg: ResMut<SimulationConfig>,
+    mouse: Res<ButtonInput<MouseButton>>,
+
+    mut params: ParamSet<(
+        Query<(
+            &GlobalTransform,
+            &ComputedNode,
+            &Node,
+            &Slider,
+            &Interaction,
+            &Children,
+        )>,
+        Query<(&mut Node, &SliderKnob)>,
+        Query<(&mut Text, &SliderValueText)>,
+    )>,
+) {
+    if !cfg.debug_panel_enabled {
+        return;
+    }
+
+    let Ok(window) = q_window.single() else { return; };
+    let Some(cursor) = window.cursor_position() else { return; };
+
+    // Update value texts
+    for (mut t, tag) in params.p2().iter_mut() {
+        let val = get_field_f32(&cfg, tag.field);
+        **t = match tag.field {
+            ConfigField::PlantSpawnChance => format!("{:.3}", val),
+            ConfigField::SheepAdultSeconds | ConfigField::WolfAdultSeconds => format!("{:.1}", val),
+            _ => format!("{:.2}", val),
+        };
+    }
+
+    let track_width_px = |node: &Node| -> f32 {
+        match node.width {
+            Val::Px(px) => px,
+            _ => 220.0,
+        }
+    };
+
+    // -------- Pass 1: snapshot all knob updates we want to apply --------
+    // (child_entity, slider_field, left_px)
+    let mut knob_updates: Vec<(Entity, ConfigField, f32)> = Vec::new();
+
+    // If not dragging, we sync ALL knobs to cfg
+    if !mouse.pressed(MouseButton::Left) {
+        for (_gt, _computed, node, slider, _interaction, children) in params.p0().iter() {
+            let width_px = track_width_px(node).max(1.0);
+            let val = get_field_f32(&cfg, slider.field);
+            let t = ((val - slider.min) / (slider.max - slider.min)).clamp(0.0, 1.0);
+            let left_px = t * (width_px - 12.0);
+
+            for child in children.iter() {
+                knob_updates.push((child, slider.field, left_px));
+            }
+        }
+    } else {
+        // Dragging: only update pressed track(s)
+        for (gt, _computed, node, slider, interaction, children) in params.p0().iter() {
+            if *interaction != Interaction::Pressed {
+                continue;
+            }
+
+            let width_px = track_width_px(node).max(1.0);
+            let center = gt.translation().truncate();
+            let min_x = center.x - (width_px * 0.5);
+            let max_x = center.x + (width_px * 0.5);
+
+            let t = ((cursor.x - min_x) / (max_x - min_x)).clamp(0.0, 1.0);
+            let new_val = slider.min + t * (slider.max - slider.min);
+            set_field_f32(&mut cfg, slider.field, new_val);
+
+            let left_px = t * (width_px - 12.0);
+            for child in children.iter() {
+                knob_updates.push((child, slider.field, left_px));
+            }
+        }
+    }
+
+    // -------- Pass 2: apply knob updates (now we can mutably borrow p1 safely) --------
+    {
+        let mut q_knob = params.p1();
+        for (child_entity, field, left_px) in knob_updates {
+            if let Ok((mut knob_node, knob)) = q_knob.get_mut(child_entity) {
+                if knob.field == field {
+                    knob_node.left = Val::Px(left_px);
+                }
+            }
+        }
+    }
+}
+
+// ---- Textbox behavior: click focus + type + Enter commit ----
+fn debug_textbox_system(
+    mut cfg: ResMut<SimulationConfig>,
+    mut focus: ResMut<TextBoxFocus>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut key_evr: MessageReader<KeyboardInput>,
+    mut q_tb: Query<(&TextBox, &Interaction, &Children)>,
+    mut q_text: Query<(&mut Text, &TextBoxText)>,
+) {
+    if !cfg.debug_panel_enabled { return; }
+
+    // handle clicks to set focus
+    for (tb, interaction, children) in q_tb.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            focus.active = Some(tb.field);
+            focus.buffer.clear();
+
+            // seed buffer with current value
+            match tb.field {
+                ConfigField::SheepStartCount => focus.buffer = cfg.s(0).starting_count.to_string(),
+                ConfigField::WolfStartCount => focus.buffer = cfg.s(1).starting_count.to_string(),
+                _ => {}
+            }
+
+            // update visible text immediately
+            for child in children.iter() {
+                if let Ok((mut t, tag)) = q_text.get_mut(child) {
+                    if tag.field == tb.field {
+                        **t = focus.buffer.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // If no active textbox, still keep display updated from cfg
+    if focus.active.is_none() {
+        for (mut t, tag) in q_text.iter_mut() {
+            **t = match tag.field {
+                ConfigField::SheepStartCount => cfg.s(0).starting_count.to_string(),
+                ConfigField::WolfStartCount => cfg.s(1).starting_count.to_string(),
+                _ => "".to_string(),
+            };
+        }
+        return;
+    }
+
+    let active = focus.active.unwrap();
+
+    // typing
+    for ev in key_evr.read() {
+        if !ev.state.is_pressed() {
+            continue;
+        }
+
+        if let Key::Character(ref s) = ev.logical_key {
+            for c in s.chars() {
+                if c.is_ascii_digit() {
+                    focus.buffer.push(c);
+                }
+            }
+        }
+    }
+
+
+    // backspace
+    if keys.just_pressed(KeyCode::Backspace) {
+        focus.buffer.pop();
+    }
+
+    // cancel
+    if keys.just_pressed(KeyCode::Escape) {
+        focus.active = None;
+        focus.buffer.clear();
+        return;
+    }
+
+    // commit
+    if keys.just_pressed(KeyCode::Enter) {
+        if let Ok(v) = focus.buffer.parse::<u32>() {
+            match active {
+                ConfigField::SheepStartCount => cfg.s_mut(0).starting_count = v.clamp(0, 200),
+                ConfigField::WolfStartCount => cfg.s_mut(1).starting_count = v.clamp(0, 200),
+                _ => {}
+            }
+        }
+        focus.active = None;
+        focus.buffer.clear();
+        return;
+    }
+
+    // update visible text for active box
+    for (mut t, tag) in q_text.iter_mut() {
+        if tag.field == active {
+            **t = focus.buffer.clone();
+        }
+    }
+}
+
+// =========================
+// 5) FIELD GET/SET HELPERS (for sliders)
+// =========================
+fn get_field_f32(cfg: &SimulationConfig, field: ConfigField) -> f32 {
+    match field {
+        ConfigField::PlantSpawnChance => cfg.plant_spawn_chance_per_tick,
+        ConfigField::SheepAdultSeconds => cfg.s(0).adult_seconds,
+        ConfigField::WolfAdultSeconds => cfg.s(1).adult_seconds,
+        _ => 0.0,
+    }
+}
+
+fn set_field_f32(cfg: &mut SimulationConfig, field: ConfigField, val: f32) {
+    match field {
+        ConfigField::PlantSpawnChance => cfg.plant_spawn_chance_per_tick = val.clamp(0.0, 1.0),
+        ConfigField::SheepAdultSeconds => cfg.s_mut(0).adult_seconds = val.clamp(1.0, 600.0),
+        ConfigField::WolfAdultSeconds => cfg.s_mut(1).adult_seconds = val.clamp(1.0, 600.0),
+        _ => {}
     }
 }
