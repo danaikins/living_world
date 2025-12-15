@@ -106,6 +106,9 @@ struct Digesting; // State 1: Immobile, waiting for hunger > 0
 #[derive(Component)]
 struct Overfed(Timer); // State 2: Slow movement for 5 ticks
 
+#[derive(Component)]
+struct WolfPart;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -646,6 +649,13 @@ fn creature_state_update(
         // 4. Starvation
         if hunger.0 >= 100.0 {
             commands.entity(entity).insert(Dead);
+
+            // say what creature starved in a println
+            if stats.species_id == 0 {
+                println!("A sheep has starved to death!");
+            } else {
+                println!("A wolf has starved to death!");
+            }
         }
     }
 }
@@ -745,7 +755,12 @@ fn creature_reproduction(
             commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
             commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
 
-            println!("A baby was born!");
+            // say what creature died in a println
+            if stats_a.species_id == 0 {
+                println!("A new sheep is born!");
+            } else {
+                println!("A new wolf is born!");
+            }
         }
     }
 }
