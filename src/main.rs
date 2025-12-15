@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow; // Needed to get mouse coordinates
+use std::collections::HashMap;
 
 // Constants
 const TILE_WIDTH: f32 = 64.0;
@@ -106,8 +107,26 @@ struct Digesting; // State 1: Immobile, waiting for hunger > 0
 #[derive(Component)]
 struct Overfed(Timer); // State 2: Slow movement for 5 ticks
 
+//#[derive(Component)]
+//struct WolfPart;
+
+#[derive(Default, Resource)]
+struct PopulationStats {
+    // species_id -> counters
+    species: HashMap<u32, SpeciesCounters>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct SpeciesCounters {
+    born: u32,        // born via reproduction
+    total_ever: u32,  // total spawned ever (initial + births)
+}
+
 #[derive(Component)]
-struct WolfPart;
+struct SpeciesStatsSheepText;
+
+#[derive(Component)]
+struct SpeciesStatsWolfText;
 
 fn main() {
     App::new()
@@ -119,9 +138,13 @@ fn main() {
             }),
             ..default()
         }))
-        .add_systems(Startup, setup)
-        .add_systems(Startup, spawn_map)
-        .add_systems(Startup, setup_chart)
+        // A1) Guaranteed resource init (fixes the panic)
+        .insert_resource(PopulationStats::default())
+        .insert_resource(GameStats { days: 0.0 }) // optional: also move GameStats here if you want
+
+        // B) Chain Startup systems so they're ordered
+        .add_systems(Startup, (setup, spawn_map, setup_chart).chain())
+
         .add_systems(Update, (
             cursor_system,
             move_creatures,
@@ -131,26 +154,27 @@ fn main() {
             reaper_system,
             handle_exhaustion,
             update_stats_ui,
+            update_species_stats_ui, // <-- make sure this is added
             update_chart_ui,
             creature_state_update,
             creature_eating,
             predator_hunting_system,
-            creature_reproduction
+            creature_reproduction,
         ))
         .run();
 }
 
 fn setup(mut commands: Commands) {
     // 1. Initialize Game Stats Resource (Day 0)
-    commands.insert_resource(GameStats { days: 0.0 });
+    //commands.insert_resource(GameStats { days: 0.0 });
+
+    // NEW: Init population stats
+    //commands.insert_resource(PopulationStats::default());
 
     // 2. Spawn Camera
     let mut camera_transform = Transform::from_xyz(0.0, 0.0, 1000.0);
     camera_transform.scale = Vec3::new(1.5, 1.5, 1.0);
-    commands.spawn((
-        Camera2d,
-        camera_transform
-    ));
+    commands.spawn((Camera2d, camera_transform));
 
     // 3. Spawn Cursor
     commands.spawn((
@@ -159,7 +183,7 @@ fn setup(mut commands: Commands) {
         MapCursor,
     ));
 
-    // 4. Spawn UI Text (Top-Left)
+    // 4. Spawn UI Text (Top-Left) - general world stats (keep yours)
     commands.spawn((
         Text::new("Stats: Loading..."),
         TextFont {
@@ -172,27 +196,90 @@ fn setup(mut commands: Commands) {
             left: Val::Px(10.0),
             ..default()
         },
-        StatsText, // Tag it so we can update it
+        StatsText,
     ));
+
+    // 5. NEW: Species Stats Panel (Top-Left, below general stats)
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(160.0),
+            left: Val::Px(10.0),
+            padding: UiRect::all(Val::Px(10.0)),
+            column_gap: Val::Px(25.0),
+            flex_direction: FlexDirection::Row, // columns side-by-side
+            ..default()
+        })
+        .insert(BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)))
+        .with_children(|parent| {
+            // ---- COLUMN 1: Sheep ----
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|col| {
+                    col.spawn((
+                        Text::new("Sheep"),
+                        TextFont { font_size: 16.0, ..default() },
+                        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+                    ));
+                    col.spawn((
+                        Text::new("Born: 0\nCurrent: 0\nTotal Ever: 0"),
+                        TextFont { font_size: 14.0, ..default() },
+                        SpeciesStatsSheepText,
+                    ));
+                });
+
+            // ---- COLUMN 2: Wolves ----
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|col| {
+                    col.spawn((
+                        Text::new("Wolves"),
+                        TextFont { font_size: 16.0, ..default() },
+                        TextColor(Color::srgb(1.0, 1.0, 1.0)),
+                    ));
+                    col.spawn((
+                        Text::new("Born: 0\nCurrent: 0\nTotal Ever: 0"),
+                        TextFont { font_size: 14.0, ..default() },
+                        SpeciesStatsWolfText,
+                    ));
+                });
+        });
 }
 
-fn spawn_map(mut commands: Commands) {
+fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
     // 1. Spawn Ground
     for x in -MAP_SIZE..MAP_SIZE {
         for y in -MAP_SIZE..MAP_SIZE {
             let screen_x = (x - y) as f32 * (TILE_WIDTH / 2.0);
             let screen_y = (x + y) as f32 * (TILE_HEIGHT / 2.0);
             commands.spawn((
-                Sprite::from_color(Color::srgb(0.3, 0.5, 0.3), Vec2::new(TILE_WIDTH - 2.0, TILE_HEIGHT - 2.0)),
+                Sprite::from_color(
+                    Color::srgb(0.3, 0.5, 0.3),
+                    Vec2::new(TILE_WIDTH - 2.0, TILE_HEIGHT - 2.0),
+                ),
                 Transform::from_xyz(screen_x, screen_y, 0.0),
                 Tile { x, y },
             ));
         }
     }
 
-    // 2. Spawn Sheep (White)
-    // Spawn Sheep
+    // 2. Spawn Sheep (White) - count as total ever
     for i in 0..8 {
+        let species_id = 0_u32;
+        stats
+            .species
+            .entry(species_id)
+            .or_default()
+            .total_ever += 1;
+
         commands.spawn((
             Sprite::from_color(Color::srgb(1.0, 1.0, 1.0), Vec2::new(20.0, 20.0)),
             Transform::from_xyz(0.0, 0.0, 2.0),
@@ -200,16 +287,23 @@ fn spawn_map(mut commands: Commands) {
             GridPosition { x: i, y: i },
             MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
             Hunger(0.0),
-            CreatureStats { sight_range: 8, species_id: 0 },
+            CreatureStats { sight_range: 8, species_id },
             CreatureBehavior { scared_of_water: true, altruistic: true },
             Age { seconds_alive: 20.0, is_adult: true },
-            History { last_x: i, last_y: i }, // NEW
+            History { last_x: i, last_y: i },
         ));
     }
 
-    // Spawn Wolves
+    // 3. Spawn Wolves - count as total ever
     let wolf_coords = vec![(-5, -5), (5, -5)];
     for (wx, wy) in wolf_coords {
+        let species_id = 1_u32;
+        stats
+            .species
+            .entry(species_id)
+            .or_default()
+            .total_ever += 1;
+
         commands.spawn((
             Sprite::from_color(Color::srgb(0.4, 0.2, 0.1), Vec2::new(22.0, 22.0)),
             Transform::from_xyz(0.0, 0.0, 2.0),
@@ -217,10 +311,10 @@ fn spawn_map(mut commands: Commands) {
             GridPosition { x: wx, y: wy },
             MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
             Hunger(0.0),
-            CreatureStats { sight_range: 10, species_id: 1 },
+            CreatureStats { sight_range: 10, species_id },
             CreatureBehavior { scared_of_water: true, altruistic: false },
             Age { seconds_alive: 20.0, is_adult: true },
-            History { last_x: wx, last_y: wy }, // NEW
+            History { last_x: wx, last_y: wy },
         ));
     }
 }
@@ -717,10 +811,25 @@ fn creature_eating(
 // We use 'iter_combinations' to check every unique pair of creatures safely
 fn creature_reproduction(
     mut commands: Commands,
-    q_creatures: Query<(Entity, &GridPosition, &Age, &CreatureStats, &CreatureBehavior, Option<&ReproductionCooldown>, Option<&Digesting>, Option<&Overfed>), (With<Creature>, Without<Dead>)>,
+    mut pop: ResMut<PopulationStats>,
+    q_creatures: Query<
+        (
+            Entity,
+            &GridPosition,
+            &Age,
+            &CreatureStats,
+            &CreatureBehavior,
+            Option<&ReproductionCooldown>,
+            Option<&Digesting>,
+            Option<&Overfed>,
+        ),
+        (With<Creature>, Without<Dead>),
+    >,
 ) {
-    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, digest_a, fed_a),
-    (entity_b, pos_b, age_b, stats_b, _, cooldown_b, digest_b, fed_b)] in q_creatures.iter_combinations()
+    for [
+    (entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, digest_a, fed_a),
+    (entity_b, pos_b, age_b, stats_b, _, cooldown_b, digest_b, fed_b),
+    ] in q_creatures.iter_combinations()
     {
         if !age_a.is_adult || !age_b.is_adult { continue; }
         if cooldown_a.is_some() || cooldown_b.is_some() { continue; }
@@ -738,6 +847,13 @@ fn creature_reproduction(
             let screen_x = (baby_x - baby_y) as f32 * (TILE_WIDTH / 2.0);
             let screen_y = (baby_x + baby_y) as f32 * (TILE_HEIGHT / 2.0);
 
+            let species_id = stats_a.species_id;
+
+            // NEW: stats bump
+            let entry = pop.species.entry(species_id).or_default();
+            entry.born += 1;
+            entry.total_ever += 1;
+
             commands.spawn((
                 Sprite::from_color(Color::srgb(1.0, 1.0, 1.0), Vec2::new(10.0, 10.0)),
                 Transform::from_xyz(screen_x, screen_y, 2.0),
@@ -745,18 +861,16 @@ fn creature_reproduction(
                 GridPosition { x: baby_x, y: baby_y },
                 MoveTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
                 Hunger(0.0),
-                // Correctly passing ONE set of stats
-                CreatureStats { sight_range: stats_a.sight_range, species_id: stats_a.species_id },
+                CreatureStats { sight_range: stats_a.sight_range, species_id },
                 CreatureBehavior { scared_of_water: behavior_a.scared_of_water, altruistic: behavior_a.altruistic },
                 Age { seconds_alive: 0.0, is_adult: false },
-                History { last_x: baby_x, last_y: baby_y }, // Only once
+                History { last_x: baby_x, last_y: baby_y },
             ));
 
             commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
             commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(70.0, TimerMode::Once)));
 
-            // say what creature died in a println
-            if stats_a.species_id == 0 {
+            if species_id == 0 {
                 println!("A new sheep is born!");
             } else {
                 println!("A new wolf is born!");
@@ -821,6 +935,47 @@ fn update_stats_ui(
         );
     }
 }
+
+fn update_species_stats_ui(
+    pop: Res<PopulationStats>,
+    q_creatures: Query<&CreatureStats, (With<Creature>, Without<Dead>)>,
+
+    mut text_params: ParamSet<(
+        Query<&mut Text, With<SpeciesStatsSheepText>>,
+        Query<&mut Text, With<SpeciesStatsWolfText>>,
+    )>,
+) {
+    let mut sheep_current: u32 = 0;
+    let mut wolf_current: u32 = 0;
+
+    for stats in q_creatures.iter() {
+        match stats.species_id {
+            0 => sheep_current += 1,
+            1 => wolf_current += 1,
+            _ => {}
+        }
+    }
+
+    let sheep_counters = pop.species.get(&0).copied().unwrap_or_default();
+    let wolf_counters = pop.species.get(&1).copied().unwrap_or_default();
+
+    // Sheep column text
+    for mut t in text_params.p0().iter_mut() {
+        **t = format!(
+            "Born: {}\nCurrent: {}\nTotal Ever: {}",
+            sheep_counters.born, sheep_current, sheep_counters.total_ever
+        );
+    }
+
+    // Wolf column text
+    for mut t in text_params.p1().iter_mut() {
+        **t = format!(
+            "Born: {}\nCurrent: {}\nTotal Ever: {}",
+            wolf_counters.born, wolf_current, wolf_counters.total_ever
+        );
+    }
+}
+
 
 fn setup_chart(mut commands: Commands) {
     // Container Node (Top Right)
