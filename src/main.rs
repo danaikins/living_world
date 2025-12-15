@@ -254,7 +254,7 @@ fn cursor_system(
             cursor_transform.translation.y = (snapped_x + snapped_y) * half_h;
 
             // --- LEFT CLICK: Create Water & Destroy Nature ---
-            if mouse_input.pressed(MouseButton::Left) {
+            if mouse_input.just_pressed(MouseButton::Left) {
                 // 1. Turn Tile Blue
                 for (entity, tile, mut sprite) in q_tiles.iter_mut() {
                     if tile.x == snapped_x as i32 && tile.y == snapped_y as i32 {
@@ -381,13 +381,21 @@ fn move_creatures(
             let moves = [(0,1), (0,-1), (-1,0), (1,0)];
             let mut best_move = (0, 0);
             let mut best_score = -9999;
-            let random_bias = rand::random::<i32>() % 5;
+
+            // Determine if we're actively pursuing/fleeing
+            let has_target = best_target_pos.is_some();
 
             for (dx, dy) in moves {
                 let check_x = my_pos.x + dx;
                 let check_y = my_pos.y + dy;
 
-                let mut score = random_bias;
+                // Start with random bias (stronger when not pursuing)
+                let random_component = if has_target {
+                    rand::random::<i32>() % 3  // Small randomness when focused
+                } else {
+                    rand::random::<i32>() % 20  // Much larger randomness when wandering
+                };
+                let mut score = random_component;
 
                 // Bounds Check
                 if check_x < -MAP_SIZE || check_x >= MAP_SIZE || check_y < -MAP_SIZE || check_y >= MAP_SIZE {
@@ -404,17 +412,24 @@ fn move_creatures(
                     }
                 }
 
-                // --- NEW: HISTORY CHECK (Anti-Dance) ---
-                // If this move puts us back where we just were, penalize it heavily.
+                // History Check (Anti-Dance)
+                // Only apply strong penalty if we have valid moves or a target
                 if check_x == history.last_x && check_y == history.last_y {
-                    score -= 50;
+                    if has_target {
+                        score -= 100;  // Strongly avoid when chasing/fleeing
+                    } else {
+                        score -= 30;   // Moderate penalty when wandering
+                    }
                 }
 
-                // Target Logic
+                // Target Logic (Only applies when we have a target)
                 if let Some((tx, ty)) = best_target_pos {
                     let dist_after_move = (check_x - tx).abs() + (check_y - ty).abs();
-                    if my_stats.species_id == 1 { score -= dist_after_move * 10; }
-                    else { score += dist_after_move * 10; }
+                    if my_stats.species_id == 1 {
+                        score -= dist_after_move * 15;  // Wolves chase aggressively
+                    } else {
+                        score += dist_after_move * 15;  // Sheep flee urgently
+                    }
                 }
 
                 if score > best_score {
