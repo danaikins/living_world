@@ -271,14 +271,12 @@ fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
         }
     }
 
-    // 2. Spawn Sheep (White) - count as total ever
+    // Spawn Sheep (start as babies; count as born + total ever)
     for i in 0..8 {
         let species_id = 0_u32;
-        stats
-            .species
-            .entry(species_id)
-            .or_default()
-            .total_ever += 1;
+        let entry = stats.species.entry(species_id).or_default();
+        entry.born += 1;
+        entry.total_ever += 1;
 
         commands.spawn((
             Sprite::from_color(Color::srgb(1.0, 1.0, 1.0), Vec2::new(20.0, 20.0)),
@@ -289,20 +287,18 @@ fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
             Hunger(0.0),
             CreatureStats { sight_range: 8, species_id },
             CreatureBehavior { scared_of_water: true, altruistic: true },
-            Age { seconds_alive: 20.0, is_adult: true },
+            Age { seconds_alive: 0.0, is_adult: false }, // <-- BABY
             History { last_x: i, last_y: i },
         ));
     }
 
-    // 3. Spawn Wolves - count as total ever
+    // Spawn Wolves (start as babies; count as born + total ever)
     let wolf_coords = vec![(-5, -5), (5, -5)];
     for (wx, wy) in wolf_coords {
         let species_id = 1_u32;
-        stats
-            .species
-            .entry(species_id)
-            .or_default()
-            .total_ever += 1;
+        let entry = stats.species.entry(species_id).or_default();
+        entry.born += 1;
+        entry.total_ever += 1;
 
         commands.spawn((
             Sprite::from_color(Color::srgb(0.4, 0.2, 0.1), Vec2::new(22.0, 22.0)),
@@ -313,7 +309,7 @@ fn spawn_map(mut commands: Commands, mut stats: ResMut<PopulationStats>) {
             Hunger(0.0),
             CreatureStats { sight_range: 10, species_id },
             CreatureBehavior { scared_of_water: true, altruistic: false },
-            Age { seconds_alive: 20.0, is_adult: true },
+            Age { seconds_alive: 0.0, is_adult: false }, // <-- BABY
             History { last_x: wx, last_y: wy },
         ));
     }
@@ -391,7 +387,7 @@ fn cursor_system(
 fn move_creatures(
     time: Res<Time>,
     mut param_set: ParamSet<(
-        Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
+        Query<(Entity, &GridPosition, &CreatureStats, &Age), (With<Creature>, Without<Dead>)>,
         Query<(
             Entity,
             &mut GridPosition,
@@ -409,38 +405,32 @@ fn move_creatures(
         Query<&GridPosition, With<Water>>,
     )>,
 ) {
-    // 1. Creature snapshot
+    // 1) Creature snapshot now includes adulthood
     struct CreatureSnapshot {
         entity: Entity,
         x: i32,
         y: i32,
         species: u32,
+        is_adult: bool,
     }
+
     let creature_targets: Vec<CreatureSnapshot> = param_set
         .p0()
         .iter()
-        .map(|(e, pos, stats)| CreatureSnapshot {
+        .map(|(e, pos, stats, age)| CreatureSnapshot {
             entity: e,
             x: pos.x,
             y: pos.y,
             species: stats.species_id,
+            is_adult: age.is_adult,
         })
         .collect();
 
-    // 2. Plant and water snapshots (done here while no mutable borrow active)
-    let plant_positions: Vec<(i32, i32)> = param_set
-        .p2()
-        .iter()
-        .map(|pos| (pos.x, pos.y))
-        .collect();
+    // 2) Plant + water snapshots
+    let plant_positions: Vec<(i32, i32)> = param_set.p2().iter().map(|p| (p.x, p.y)).collect();
+    let water_tiles: Vec<(i32, i32)> = param_set.p3().iter().map(|p| (p.x, p.y)).collect();
 
-    let water_tiles: Vec<(i32, i32)> = param_set
-        .p3()
-        .iter()
-        .map(|pos| (pos.x, pos.y))
-        .collect();
-
-    // 3. Now mutate creatures — safe because p0, p2, p3 are no longer borrowed
+    // 3) Mutate creatures
     for (
         my_entity,
         mut my_pos,
@@ -452,10 +442,10 @@ fn move_creatures(
         digesting,
         overfed,
         my_hunger,
-        age,
+        my_age,
     ) in param_set.p1().iter_mut()
     {
-        // Timer logic
+        // Timer logic unchanged...
         let base_duration = 0.2;
         let mut target_duration = if cooldown.is_some() { 0.5 } else { base_duration };
         if overfed.is_some() {
@@ -473,13 +463,21 @@ fn move_creatures(
 
         // === TARGET SELECTION ===
         let mut target_pos: Option<(i32, i32)> = None;
-        let mut target_type = 0; // 1=food, 2=mate, 3=prey, 4=predator
+
+        // target_type:
+        // 1 = fruit (plant), 2 = mate, 3 = prey (sheep), 4 = predator (wolf)
+        let mut target_type: i32 = 0;
+        let mut target_weight: i32 = 20; // multiplier for distance delta scoring
 
         let is_sheep = my_stats.species_id == 0;
+        let is_wolf = my_stats.species_id == 1;
+
         let hunger_level = my_hunger.0;
         let is_full = hunger_level <= 10.0;
-        let can_breed = age.is_adult && cooldown.is_none() && digesting.is_none() && overfed.is_none();
 
+        let can_breed = my_age.is_adult && cooldown.is_none() && digesting.is_none() && overfed.is_none();
+
+        // ---------- SHEEP LOGIC ----------
         if is_sheep {
             // Seek mate if full and ready
             if is_full && can_breed {
@@ -491,6 +489,7 @@ fn move_creatures(
                         best_dist = dist;
                         target_pos = Some((other.x, other.y));
                         target_type = 2;
+                        target_weight = 20;
                     }
                 }
             }
@@ -504,29 +503,101 @@ fn move_creatures(
                         best_dist = dist;
                         target_pos = Some((px, py));
                         target_type = 1;
+                        target_weight = 20;
                     }
                 }
             }
         }
 
-        // Predator/prey override
+        // ---------- PREDATOR / PREY OVERRIDE WITH BABY RULES ----------
+        //
+        // Babies can't attack:
+        // - Wolf babies do not target sheep as prey.
+        //
+        // Not scared of other babies:
+        // - Sheep do NOT treat wolf babies as predators (no flee target).
         let mut threat_dist = 9999;
+
+        // Track best prey target for wolves
+        let mut best_prey: Option<(i32, i32, i32)> = None; // (x, y, dist)
+
+        // Track best predator threat for sheep
+        let mut best_predator: Option<(i32, i32, i32)> = None;
+
         for other in &creature_targets {
             if my_entity == other.entity { continue; }
             let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
             if dist >= my_stats.sight_range { continue; }
 
-            if my_stats.species_id == 1 && other.species == 0 {
-                if dist < threat_dist {
-                    threat_dist = dist;
-                    target_pos = Some((other.x, other.y));
-                    target_type = 3;
+            // Wolves hunting sheep (only if THIS wolf is adult; prey can be adult or baby)
+            if is_wolf && other.species == 0 {
+                if my_age.is_adult {
+                    if best_prey.map(|(_,_,d)| dist < d).unwrap_or(true) {
+                        best_prey = Some((other.x, other.y, dist));
+                    }
                 }
-            } else if my_stats.species_id == 0 && other.species == 1 {
-                if dist < threat_dist {
-                    threat_dist = dist;
-                    target_pos = Some((other.x, other.y));
-                    target_type = 4;
+            }
+            // Sheep fearing wolves (only if the wolf is adult; sheep are not scared of wolf babies)
+            else if is_sheep && other.species == 1 {
+                if other.is_adult {
+                    if best_predator.map(|(_,_,d)| dist < d).unwrap_or(true) {
+                        best_predator = Some((other.x, other.y, dist));
+                    }
+                }
+            }
+
+            // "aren't scared of other babies" also implies: if both are babies, never treat as threat/target
+            // (handled implicitly above since sheep only fear adult wolves, and wolf babies don't hunt).
+        }
+
+        // Apply best predator for sheep
+        if let Some((px, py, dist)) = best_predator {
+            threat_dist = dist;
+            target_pos = Some((px, py));
+            target_type = 4;     // flee
+            target_weight = 20;
+        }
+
+        // Apply best prey for wolves (only if no flee target set)
+        if target_type == 0 || target_type == 1 || target_type == 2 {
+            if let Some((sx, sy, dist)) = best_prey {
+                threat_dist = dist;
+                target_pos = Some((sx, sy));
+                target_type = 3;     // hunt
+                target_weight = 20;  // default hunt weight (can be adjusted below)
+            }
+        }
+
+        // ---------- WOLF FRUIT FALLBACK + LOW-HEALTH WEIGHTS ----------
+        //
+        // - Baby wolves can eat fruit.
+        // - Adult wolves can eat fruit if hunger <= 30.0.
+        // - If wolf is <= 30% health (hunger >= 70.0), prefer fruit more strongly:
+        //      fruit weight = 80%  => 80
+        //      meat  weight = 50%  => 50
+        if is_wolf {
+            let can_eat_fruit = !my_age.is_adult || hunger_level <= 30.0 || hunger_level >= 70.0;
+
+            // If wolf is low health, change weights even if meat exists.
+            if hunger_level >= 70.0 {
+                // If we already have a meat target, reduce its pull (50)
+                if target_type == 3 {
+                    target_weight = 50;
+                }
+            }
+
+            // If no meat target found, seek fruit (if allowed)
+            if can_eat_fruit && (target_type != 3) {
+                let mut best_dist = 9999;
+                for &(px, py) in &plant_positions {
+                    let dist = (my_pos.x - px).abs() + (my_pos.y - py).abs();
+                    if dist > 0 && dist < my_stats.sight_range && dist < best_dist {
+                        best_dist = dist;
+                        target_pos = Some((px, py));
+                        target_type = 1; // fruit
+                        // Low health = strong fruit pull
+                        target_weight = if hunger_level >= 70.0 { 80 } else { 20 };
+                    }
                 }
             }
         }
@@ -560,8 +631,10 @@ fn move_creatures(
                 let delta = dist_after - dist_now;
 
                 match target_type {
-                    1 | 2 | 3 => score -= delta * 20,
-                    4 => score += delta * 20,
+                    // toward fruit/mate/prey
+                    1 | 2 | 3 => score -= delta * target_weight,
+                    // away from predator
+                    4 => score += delta * target_weight,
                     _ => {}
                 }
             }
@@ -757,51 +830,61 @@ fn creature_state_update(
 // SYSTEM 2: Handling Eating (Interactions with Plants)
 fn creature_eating(
     mut commands: Commands,
-    mut q_creatures: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &CreatureBehavior, Option<&Digesting>), (With<Creature>, Without<Dead>)>,
+    mut q_creatures: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &CreatureBehavior, &Age, Option<&Digesting>), (With<Creature>, Without<Dead>)>,
     q_plants: Query<(Entity, &GridPosition), (With<Plant>, Without<Dead>)>,
-    // Read-only access for altruism check
     q_all_creatures: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
 ) {
     for (plant_entity, plant_pos) in q_plants.iter() {
-        for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior, digesting) in q_creatures.iter_mut() {
-
-            // Quick checks to skip unnecessary processing
-            if my_stats.species_id == 1 { continue; }
+        for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior, my_age, digesting) in q_creatures.iter_mut() {
             if digesting.is_some() { continue; }
 
-            if my_pos.x == plant_pos.x && my_pos.y == plant_pos.y {
+            let is_sheep = my_stats.species_id == 0;
+            let is_wolf = my_stats.species_id == 1;
 
-                // Full Check
+            // Sheep can always eat plants (existing behavior)
+            // Wolves can eat plants only if:
+            // - baby wolf OR hunger <= 30 OR very low health (hunger >= 70)
+            let wolf_can_eat_plant = !my_age.is_adult || my_hunger.0 <= 30.0 || my_hunger.0 >= 70.0;
+
+            if is_wolf && !wolf_can_eat_plant {
+                continue;
+            }
+
+            if my_pos.x == plant_pos.x && my_pos.y == plant_pos.y {
+                // Full check (keep it: no point eating if already essentially full)
                 if my_hunger.0 < 5.0 { continue; }
 
-                // Altruism Check
-                let mut should_eat = true;
-                if my_behavior.altruistic && my_hunger.0 < 20.0 {
-                    for (other_entity, other_pos, other_stats) in q_all_creatures.iter() {
-                        if my_entity == other_entity { continue; }
-                        let dist = (my_pos.x - other_pos.x).abs() + (my_pos.y - other_pos.y).abs();
-                        if other_stats.species_id == my_stats.species_id && dist <= my_stats.sight_range {
-                            should_eat = false;
-                            break;
+                // Altruism only applies to sheep (wolves ignore altruism)
+                if is_sheep {
+                    let mut should_eat = true;
+                    if my_behavior.altruistic && my_hunger.0 < 20.0 {
+                        for (other_entity, other_pos, other_stats) in q_all_creatures.iter() {
+                            if my_entity == other_entity { continue; }
+                            let dist = (my_pos.x - other_pos.x).abs() + (my_pos.y - other_pos.y).abs();
+                            if other_stats.species_id == my_stats.species_id && dist <= my_stats.sight_range {
+                                should_eat = false;
+                                break;
+                            }
                         }
                     }
+                    if !should_eat { continue; }
                 }
 
-                if should_eat {
-                    my_hunger.0 = 0.0;
-                    commands.entity(plant_entity).insert(Dead);
+                // Eat plant
+                my_hunger.0 = 0.0;
+                commands.entity(plant_entity).insert(Dead);
 
-                    // Spawn Exhausted Soil
-                    let screen_x = (my_pos.x - my_pos.y) as f32 * (TILE_WIDTH / 2.0);
-                    let screen_y = (my_pos.x + my_pos.y) as f32 * (TILE_HEIGHT / 2.0);
-                    commands.spawn((
-                        Sprite::from_color(Color::srgb(0.5, 0.25, 0.0), Vec2::new(10.0, 40.0)),
-                        Transform::from_xyz(screen_x, screen_y, 0.1).with_rotation(Quat::from_rotation_z(0.785)),
-                        ExhaustedSoil(Timer::from_seconds(10.0, TimerMode::Once)),
-                        GridPosition { x: my_pos.x, y: my_pos.y },
-                    ));
-                }
-                break; // Plant eaten
+                // Spawn Exhausted Soil (existing)
+                let screen_x = (my_pos.x - my_pos.y) as f32 * (TILE_WIDTH / 2.0);
+                let screen_y = (my_pos.x + my_pos.y) as f32 * (TILE_HEIGHT / 2.0);
+                commands.spawn((
+                    Sprite::from_color(Color::srgb(0.5, 0.25, 0.0), Vec2::new(10.0, 40.0)),
+                    Transform::from_xyz(screen_x, screen_y, 0.1).with_rotation(Quat::from_rotation_z(0.785)),
+                    ExhaustedSoil(Timer::from_seconds(10.0, TimerMode::Once)),
+                    GridPosition { x: my_pos.x, y: my_pos.y },
+                ));
+
+                break; // plant eaten
             }
         }
     }
@@ -1104,28 +1187,23 @@ fn update_chart_ui(
 
 fn predator_hunting_system(
     mut commands: Commands,
-    mut q_wolves: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats), (With<Creature>, Without<Dead>)>,
+    mut q_wolves: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &Age), (With<Creature>, Without<Dead>)>,
     q_sheep: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
 ) {
-    for (wolf_entity, wolf_pos, mut wolf_hunger, wolf_stats) in q_wolves.iter_mut() {
+    for (wolf_entity, wolf_pos, mut wolf_hunger, wolf_stats, wolf_age) in q_wolves.iter_mut() {
         if wolf_stats.species_id != 1 { continue; }
+        if !wolf_age.is_adult { continue; } // <-- BABIES CAN'T ATTACK
 
         for (sheep_entity, sheep_pos, sheep_stats) in q_sheep.iter() {
             if sheep_stats.species_id != 0 { continue; }
 
             if wolf_pos.x == sheep_pos.x && wolf_pos.y == sheep_pos.y {
-
-                // --- CHANGED LOGIC ---
-                // 1. Overhealed: Set hunger to -5.0 (5 points "extra" health)
+                // Gorge + digest (existing)
                 wolf_hunger.0 = -5.0;
-
-                // 2. Digesting State: Freeze the wolf
                 commands.entity(wolf_entity).insert(Digesting);
-
-                // 3. Kill Sheep
                 commands.entity(sheep_entity).insert(Dead);
 
-                // Blood FX
+                // Blood FX (existing)
                 let screen_x = (wolf_pos.x - wolf_pos.y) as f32 * (TILE_WIDTH / 2.0);
                 let screen_y = (wolf_pos.x + wolf_pos.y) as f32 * (TILE_HEIGHT / 2.0);
                 commands.spawn((
@@ -1136,9 +1214,6 @@ fn predator_hunting_system(
                 ));
 
                 println!("Wolf is gorging!");
-
-                // Note: Reproduction check removed here.
-                // We shouldn't spawn babies while face-deep in a sheep.
                 break;
             }
         }
