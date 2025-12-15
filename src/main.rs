@@ -8,7 +8,7 @@ use std::collections::HashMap;
 // Constants
 const TILE_WIDTH: f32 = 64.0;
 const TILE_HEIGHT: f32 = 32.0;
-const MAP_SIZE: i32 = 20;
+//const MAP_SIZE: i32 = 20;
 
 // ========================
 // 1) CONFIG RESOURCE
@@ -80,11 +80,11 @@ impl Default for SimulationConfig {
             0,
             SpeciesConfig {
                 name: "Sheep",
-                starting_count: 12,          // CONFIG: starting sheep
-                adult_seconds: 10.0,         // CONFIG: sheep mature faster
-                reproduction_chance: 0.10,   // CONFIG
-                reproduction_cooldown_seconds: 30.0, // CONFIG: reduced cooldown
-                sight_range: 8,              // CONFIG
+                starting_count: 20,          // INCREASED: Give prey a head start
+                adult_seconds: 10.0,
+                reproduction_chance: 0.15,   // INCREASED: Sheep breed faster
+                reproduction_cooldown_seconds: 20.0, // FASTER: Sheep recover quickly
+                sight_range: 8,
             },
         );
 
@@ -93,52 +93,48 @@ impl Default for SimulationConfig {
             1,
             SpeciesConfig {
                 name: "Wolves",
-                starting_count: 4,           // CONFIG: starting wolves
-                adult_seconds: 20.0,         // CONFIG
-                reproduction_chance: 0.10,   // CONFIG (same as sheep for now)
-                reproduction_cooldown_seconds: 70.0, // CONFIG
-                sight_range: 10,             // CONFIG
+                starting_count: 6,           // INCREASED: 4 was too fragile
+                adult_seconds: 15.0,         // FASTER: Maturation
+                reproduction_chance: 0.10,
+                reproduction_cooldown_seconds: 40.0, // REDUCED: Was 70.0 (too long)
+                sight_range: 12,             // INCREASED: Predators have better eyes
             },
         );
 
         Self {
-            // Map / tiles (mirror your constants)
             map_size: 20,
             tile_w: 64.0,
             tile_h: 32.0,
 
-            // Growth
-            plant_spawn_chance_per_tick: 0.05,
+            plant_spawn_chance_per_tick: 0.10, // INCREASED: More food for sheep = more sheep
             soil_exhaust_seconds_after_eat: 10.0,
             blood_fx_seconds: 30.0,
 
-            // Movement
             base_move_seconds: 0.2,
             reproduction_move_seconds: 0.5,
-            overfed_move_multiplier: 6.6,
 
-            // Hunger
+            // CRITICAL FIX: Was 6.6. This made wolves basically immobile after eating.
+            // Now they just move slightly slower (1.5x slower).
+            overfed_move_multiplier: 1.5,
+
             hunger_starve_threshold: 100.0,
-            sheep_hunger_burn_adult: 3.3,
-            sheep_hunger_burn_baby: 1.65,
-            wolf_hunger_burn_adult: 3.3 * 1.5,
-            wolf_hunger_burn_baby: 1.65 * 1.5,
 
-            // Eating
+            sheep_hunger_burn_adult: 3.0,
+            sheep_hunger_burn_baby: 1.5,
+
+            // CRITICAL FIX: Wolves shouldn't burn energy significantly faster than sheep.
+            // Hunting is hard enough without a hyper-metabolism.
+            wolf_hunger_burn_adult: 3.5,
+            wolf_hunger_burn_baby: 1.75,
+
             eat_skip_if_hunger_below: 5.0,
-
-            // Wolf berry stun
             wolf_berry_stun_ticks: 2,
 
-            // Low-health weights for wolves
             wolf_low_health_hunger_threshold: 70.0,
             wolf_low_health_weight_fruit: 80,
             wolf_low_health_weight_meat: 50,
 
-            // Species
             species,
-
-            // Debug UI
             debug_panel_enabled: true,
         }
     }
@@ -591,6 +587,9 @@ fn animate_world_shadow(time: Res<Time>, mut q: Query<(&mut Transform, &mut Spri
         let b = 0.06 + pulse * 0.28;
 
         spr.color = Color::srgba(r, g, b, a);
+
+        let rotation_speed = 0.05; // radians per second (adjust to taste)
+        tr.rotate_z(rotation_speed * dt);
     }
 }
 
@@ -627,7 +626,7 @@ fn cursor_system(
             cursor_transform.translation.y = (snapped_x + snapped_y) * half_h;
 
             // --- LEFT CLICK: Create Water & Destroy Nature ---
-            if mouse_input.just_pressed(MouseButton::Left) {
+            if mouse_input.pressed(MouseButton::Left) {
                 // 1. Turn Tile Blue
                 for (entity, tile, mut sprite) in q_tiles.iter_mut() {
                     if tile.x == snapped_x as i32 && tile.y == snapped_y as i32 {
@@ -669,7 +668,8 @@ fn move_creatures(
     time: Res<Time>,
     cfg: Res<SimulationConfig>,
     mut param_set: ParamSet<(
-        Query<(Entity, &GridPosition, &CreatureStats, &Age), (With<Creature>, Without<Dead>)>,
+        // 1. Add Option<&ReproductionCooldown> to this query so we know who is on cooldown
+        Query<(Entity, &GridPosition, &CreatureStats, &Age, Option<&ReproductionCooldown>), (With<Creature>, Without<Dead>)>,
         Query<(
             Entity,
             &mut GridPosition,
@@ -685,7 +685,7 @@ fn move_creatures(
             &Age,
         ), (With<Creature>, Without<Dead>)>,
         Query<&GridPosition, With<Plant>>,
-        Query<&GridPosition, With<Water>>,
+        Query<&Tile, With<Water>>,
     )>,
 ) {
     struct CreatureSnapshot {
@@ -694,17 +694,20 @@ fn move_creatures(
         y: i32,
         species: u32,
         is_adult: bool,
+        on_cooldown: bool, // 2. Add this field
     }
 
+    // 3. Capture the cooldown status in the snapshot
     let creature_targets: Vec<CreatureSnapshot> = param_set
         .p0()
         .iter()
-        .map(|(e, pos, stats, age)| CreatureSnapshot {
+        .map(|(e, pos, stats, age, cooldown)| CreatureSnapshot {
             entity: e,
             x: pos.x,
             y: pos.y,
             species: stats.species_id,
             is_adult: age.is_adult,
+            on_cooldown: cooldown.is_some(),
         })
         .collect();
 
@@ -726,7 +729,7 @@ fn move_creatures(
         my_age,
     ) in param_set.p1().iter_mut()
     {
-        // --- BERRY STUN: immobile until timer completes ---
+        // --- BERRY STUN ---
         if let Some(mut stun) = berry_stun {
             stun.0.tick(time.delta());
             if !stun.0.just_finished() {
@@ -735,12 +738,10 @@ fn move_creatures(
             commands.entity(my_entity).remove::<BerryStun>();
         }
 
-        // If digesting, no movement
         if digesting.is_some() {
             continue;
         }
 
-        // --- Movement timer (Repeating) ---
         let mut move_seconds = cfg.base_move_seconds;
         if cooldown.is_some() {
             move_seconds = cfg.reproduction_move_seconds;
@@ -752,7 +753,6 @@ fn move_creatures(
         timer.0.set_duration(std::time::Duration::from_secs_f32(move_seconds));
         timer.0.tick(time.delta());
 
-        // ✅ THIS is the important change
         if !timer.0.just_finished() {
             continue;
         }
@@ -760,9 +760,9 @@ fn move_creatures(
         let old_x = my_pos.x;
         let old_y = my_pos.y;
 
-        // === TARGET SELECTION (unchanged from your current logic) ===
+        // === TARGET SELECTION ===
         let mut target_pos: Option<(i32, i32)> = None;
-        let mut target_type: i32 = 0;      // 1=fruit, 2=mate, 3=prey, 4=predator
+        let mut target_type: i32 = 0;
         let mut target_weight: i32 = 20;
 
         let is_sheep = my_stats.species_id == 0;
@@ -777,6 +777,9 @@ fn move_creatures(
                 let mut best_dist = 9999;
                 for other in &creature_targets {
                     if my_entity == other.entity || other.species != 0 { continue; }
+                    // 4. Skip if the potential partner is on cooldown
+                    if other.on_cooldown { continue; }
+
                     let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
                     if dist > 1 && dist < my_stats.sight_range && dist < best_dist {
                         best_dist = dist;
@@ -807,6 +810,9 @@ fn move_creatures(
                 for other in &creature_targets {
                     if my_entity == other.entity || other.species != 1 { continue; }
                     if !other.is_adult { continue; }
+                    // 5. Skip if the potential partner is on cooldown
+                    if other.on_cooldown { continue; }
+
                     let dist = (my_pos.x - other.x).abs() + (my_pos.y - other.y).abs();
                     if dist > 1 && dist < my_stats.sight_range && dist < best_dist {
                         best_dist = dist;
@@ -856,8 +862,9 @@ fn move_creatures(
         }
 
         if is_wolf {
-            let can_eat_fruit = !my_age.is_adult || hunger_level <= 30.0 || hunger_level >= 70.0;
-            if hunger_level >= 70.0 && target_type == 3 {
+            let can_eat_fruit = !my_age.is_adult || hunger_level <= 30.0 || hunger_level >= 50.0;
+
+            if hunger_level >= 50.0 && target_type == 3 {
                 target_weight = 50;
             }
             if can_eat_fruit && target_type != 2 && target_type != 3 {
@@ -868,7 +875,8 @@ fn move_creatures(
                         best_dist = dist;
                         target_pos = Some((px, py));
                         target_type = 1;
-                        target_weight = if hunger_level >= 70.0 { 80 } else { 20 };
+                        // CHANGED: Weight priority triggers at 50 instead of 70
+                        target_weight = if hunger_level >= 50.0 { 80 } else { 20 };
                     }
                 }
             }
@@ -883,7 +891,6 @@ fn move_creatures(
             let nx = my_pos.x + dx;
             let ny = my_pos.y + dy;
 
-            // ✅ Use config map size, not MAP_SIZE
             if nx < -cfg.map_size || nx >= cfg.map_size || ny < -cfg.map_size || ny >= cfg.map_size {
                 continue;
             }
@@ -1021,13 +1028,20 @@ fn creature_state_update(
     mut commands: Commands,
     time: Res<Time>,
     cfg: Res<SimulationConfig>,
-    // The Query includes Option<&Digesting>
-    mut q_creatures: Query<(Entity, &mut Hunger, &mut Sprite, &mut Age, Option<&mut ReproductionCooldown>, &CreatureStats, Option<&Digesting>, Option<&mut Overfed>), (With<Creature>, Without<Dead>)>,
+    mut q_creatures: Query<(
+        Entity,
+        &mut Hunger,
+        &mut Sprite,
+        &mut Age,
+        Option<&mut ReproductionCooldown>,
+        &CreatureStats,
+        Option<&Digesting>,
+        Option<&mut Overfed>
+    ), (With<Creature>, Without<Dead>)>,
 ) {
     let dt = time.delta().as_secs_f32();
     let current_time = time.elapsed_secs();
 
-    // MAKE SURE 'digesting' IS IN THIS LIST ↓
     for (entity, mut hunger, mut sprite, mut age, mut cooldown_opt, stats, digesting, mut overfed_opt) in q_creatures.iter_mut() {
 
         // 1. Growth & Size
@@ -1040,12 +1054,6 @@ fn creature_state_update(
         let base_size = if stats.species_id == 1 { 22.0 } else { 20.0 };
         let target_scale = if age.is_adult { base_size } else { base_size / 2.0 };
         sprite.custom_size = Some(Vec2::new(target_scale, target_scale));
-/*
-        let burn_rate = if age.is_adult { 3.3 } else { 1.65 };
-        let final_burn = if stats.species_id == 1 { burn_rate * 1.5 } else { burn_rate };
-        hunger.0 += final_burn * dt;
-
- */
 
         // Burn per species + age
         let burn = match (stats.species_id, age.is_adult) {
@@ -1057,7 +1065,7 @@ fn creature_state_update(
         };
         hunger.0 += burn * dt;
 
-        // 2. DIGESTION LOGIC
+        // 2. DIGESTION & VISUALS LOGIC
         if digesting.is_some() {
             // Visual: Dark while digesting
             sprite.color = Color::srgb(0.2, 0.1, 0.05);
@@ -1065,12 +1073,11 @@ fn creature_state_update(
             // Burn off the "Overheal" (Waiting for hunger to reach 0.0)
             if hunger.0 >= 0.0 {
                 commands.entity(entity).remove::<Digesting>();
-                // Enter Overfed state (Slow movement)
                 commands.entity(entity).insert(Overfed(Timer::from_seconds(5.0, TimerMode::Once)));
             }
         }
         else if let Some(ref mut overfed_timer) = overfed_opt {
-            // Visual: Greenish tint
+            // Visual: Greenish tint (Overfed/Sluggish)
             sprite.color = Color::srgb(0.4, 0.3, 0.1);
 
             overfed_timer.0.tick(time.delta());
@@ -1079,11 +1086,23 @@ fn creature_state_update(
             }
         }
         else {
-            // Standard Colors
+            // --- UPDATED COOLDOWN VISUALS ---
             if cooldown_opt.is_some() {
-                let pulse = (current_time * 5.0).sin().abs();
-                sprite.color = Color::srgb(0.5 + 0.5 * pulse, 0.0, 1.0 - 0.5 * pulse);
-            } else {
+                let pulse = (current_time * 5.0).sin().abs(); // 0.0 to 1.0
+
+                if stats.species_id == 1 {
+                    // Wolf: Pulse between Black (0,0,0) and Dark Brown (0.3, 0.15, 0.05)
+                    let r = 0.3 * pulse;
+                    let g = 0.15 * pulse;
+                    let b = 0.05 * pulse;
+                    sprite.color = Color::srgb(r, g, b);
+                } else {
+                    // Sheep: Original Purple Pulse
+                    sprite.color = Color::srgb(0.5 + 0.5 * pulse, 0.0, 1.0 - 0.5 * pulse);
+                }
+            }
+            else {
+                // Standard Colors based on Hunger
                 if stats.species_id == 0 {
                     // Sheep
                     if hunger.0 > 90.0 { sprite.color = Color::srgb(1.0, 0.0, 0.0); }
@@ -1098,17 +1117,18 @@ fn creature_state_update(
             }
         }
 
-        // 3. Cooldown
+        // 3. Cooldown Timer Tick
         if let Some(ref mut timer) = cooldown_opt {
             timer.0.tick(time.delta());
-            if timer.0.is_finished() { commands.entity(entity).remove::<ReproductionCooldown>(); }
+            if timer.0.is_finished() {
+                commands.entity(entity).remove::<ReproductionCooldown>();
+            }
         }
 
         // 4. Starvation
         if hunger.0 >= 100.0 {
             commands.entity(entity).insert(Dead);
 
-            // say what creature starved in a println
             if stats.species_id == 0 {
                 println!("A sheep has starved to death!");
             } else {
@@ -1122,12 +1142,23 @@ fn creature_state_update(
 fn creature_eating(
     mut commands: Commands,
     cfg: Res<SimulationConfig>,
-    mut q_creatures: Query<(Entity, &GridPosition, &mut Hunger, &CreatureStats, &CreatureBehavior, &Age, Option<&Digesting>), (With<Creature>, Without<Dead>)>,
+    // 1. We added Option<&ReproductionCooldown> to the query tuple below
+    mut q_creatures: Query<(
+        Entity,
+        &GridPosition,
+        &mut Hunger,
+        &CreatureStats,
+        &CreatureBehavior,
+        &Age,
+        Option<&Digesting>,
+        Option<&ReproductionCooldown>
+    ), (With<Creature>, Without<Dead>)>,
     q_plants: Query<(Entity, &GridPosition), (With<Plant>, Without<Dead>)>,
     q_all_creatures: Query<(Entity, &GridPosition, &CreatureStats), (With<Creature>, Without<Dead>)>,
 ) {
     for (plant_entity, plant_pos) in q_plants.iter() {
-        for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior, my_age, digesting) in q_creatures.iter_mut() {
+        // 2. Added 'cooldown' to the destructuring here
+        for (my_entity, my_pos, mut my_hunger, my_stats, my_behavior, my_age, digesting, cooldown) in q_creatures.iter_mut() {
             if digesting.is_some() { continue; }
 
             if my_pos.x != plant_pos.x || my_pos.y != plant_pos.y {
@@ -1139,8 +1170,14 @@ fn creature_eating(
 
             // Sheep can always eat plants (existing behavior)
             // Wolves can eat plants only if:
-            // - baby wolf OR hunger <= 30 OR very low health (hunger >= 70)
-            let wolf_can_eat_plant = !my_age.is_adult || my_hunger.0 <= 30.0 || my_hunger.0 >= 70.0;
+            // - baby wolf
+            // - OR hunger <= 30
+            // - OR moderately hungry (hunger >= 50) <-- CHANGED from 70
+            // - OR currently on Reproduction Cooldown
+            let wolf_can_eat_plant = !my_age.is_adult
+                || my_hunger.0 <= 30.0
+                || my_hunger.0 >= 50.0
+                || cooldown.is_some();
 
             if is_wolf && !wolf_can_eat_plant {
                 continue;
@@ -1196,22 +1233,39 @@ fn creature_eating(
 }
 
 // SYSTEM 3: Handling Reproduction (Interactions with other Creatures)
-// We use 'iter_combinations' to check every unique pair of creatures safely
 fn creature_reproduction(
     mut commands: Commands,
     cfg: Res<SimulationConfig>,
     mut pop: ResMut<PopulationStats>,
-    q_creatures: Query<(Entity, &GridPosition, &Age, &CreatureStats, &CreatureBehavior, Option<&ReproductionCooldown>, Option<&Digesting>, Option<&Overfed>), (With<Creature>, Without<Dead>)>,
+    // UPDATE: Removed Option<&Digesting> and Option<&Overfed> from the query.
+    // We no longer check these, so we don't need to fetch them.
+    // BerryStun was never in the query, so it is also allowed by default.
+    q_creatures: Query<(
+        Entity,
+        &GridPosition,
+        &Age,
+        &CreatureStats,
+        &CreatureBehavior,
+        Option<&ReproductionCooldown>
+    ), (With<Creature>, Without<Dead>)>,
 ) {
-    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a, digest_a, fed_a),
-    (entity_b, pos_b, age_b, stats_b, _,          cooldown_b, digest_b, fed_b)] in q_creatures.iter_combinations()
+    for [(entity_a, pos_a, age_a, stats_a, behavior_a, cooldown_a),
+    (entity_b, pos_b, age_b, stats_b, _,          cooldown_b)] in q_creatures.iter_combinations()
     {
+        // 1. Both must be adults
         if !age_a.is_adult || !age_b.is_adult { continue; }
+
+        // 2. Neither can be on reproduction cooldown
         if cooldown_a.is_some() || cooldown_b.is_some() { continue; }
-        if digest_a.is_some() || fed_a.is_some() { continue; }
-        if digest_b.is_some() || fed_b.is_some() { continue; }
+
+        // REMOVED: The checks for Digesting and Overfed.
+        // Now, even if a wolf is digesting a sheep or stunned by berries,
+        // they can still reproduce if a partner is adjacent.
+
+        // 3. Must be same species
         if stats_a.species_id != stats_b.species_id { continue; }
 
+        // 4. Must be adjacent (Distance <= 1)
         let dist = (pos_a.x - pos_b.x).abs() + (pos_a.y - pos_b.y).abs();
         if dist > 1 { continue; }
 
@@ -1219,12 +1273,12 @@ fn creature_reproduction(
         let sc = cfg.s(sid);
 
         if rand::random::<f32>() < sc.reproduction_chance {
-            // stats bump
+            // Update stats
             let entry = pop.species.entry(sid).or_default();
             entry.born += 1;
             entry.total_ever += 1;
 
-            // spawn baby (unchanged except timing knobs if you want)
+            // Spawn baby
             let baby_x = pos_a.x;
             let baby_y = pos_a.y;
 
@@ -1246,7 +1300,7 @@ fn creature_reproduction(
                 History { last_x: baby_x, last_y: baby_y },
             ));
 
-            // CONFIG: per-species cooldown
+            // Apply Cooldowns
             let cd = sc.reproduction_cooldown_seconds;
             commands.entity(entity_a).insert(ReproductionCooldown(Timer::from_seconds(cd, TimerMode::Once)));
             commands.entity(entity_b).insert(ReproductionCooldown(Timer::from_seconds(cd, TimerMode::Once)));
@@ -1484,18 +1538,21 @@ fn predator_hunting_system(
 ) {
     for (wolf_entity, wolf_pos, mut wolf_hunger, wolf_stats, wolf_age) in q_wolves.iter_mut() {
         if wolf_stats.species_id != 1 { continue; }
-        if !wolf_age.is_adult { continue; } // <-- BABIES CAN'T ATTACK
+        if !wolf_age.is_adult { continue; }
 
         for (sheep_entity, sheep_pos, sheep_stats) in q_sheep.iter() {
             if sheep_stats.species_id != 0 { continue; }
 
             if wolf_pos.x == sheep_pos.x && wolf_pos.y == sheep_pos.y {
-                // Gorge + digest (existing)
-                wolf_hunger.0 = -5.0;
+                // CRITICAL FIX: Massive meal value.
+                // Was -5.0. Now -50.0.
+                // This means the wolf is "super full" and won't starve for a long time.
+                wolf_hunger.0 = -50.0;
+
                 commands.entity(wolf_entity).insert(Digesting);
                 commands.entity(sheep_entity).insert(Dead);
 
-                // Blood FX (existing)
+                // Blood FX
                 let screen_x = (wolf_pos.x - wolf_pos.y) as f32 * (TILE_WIDTH / 2.0);
                 let screen_y = (wolf_pos.x + wolf_pos.y) as f32 * (TILE_HEIGHT / 2.0);
                 commands.spawn((
@@ -1699,12 +1756,12 @@ fn debug_panel_visibility(
 }
 
 // ---- Slider behavior: click+drag on track ----
-fn val_to_px(v: Val) -> Option<f32> {
+/*fn val_to_px(v: Val) -> Option<f32> {
     match v {
         Val::Px(px) => Some(px),
         _ => None, // Percent/Vw/Vh/Auto etc. not handled here
     }
-}
+}*/
 
 fn debug_slider_system(
     q_window: Query<&Window, With<PrimaryWindow>>,
